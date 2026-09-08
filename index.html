@@ -6,6 +6,7 @@
 <title>Callout</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Source+Sans+3:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
   :root{
     --ink:#20242A; --paper:#F4F2EC; --panel:#FFFFFF; --line:#D8D3C6;
@@ -97,8 +98,8 @@
 </style>
 </head>
 <body>
-<div id="fallbackBanner" class="hidden" style="background:#F7E6E4; color:var(--warn); padding:9px 16px; font-size:13px; display:flex; gap:10px; align-items:center; justify-content:center; flex-wrap:wrap; text-align:center;">
-  <span>Cloud save isn't reachable right now — your data is being kept in this page only.</span>
+<div id="fallbackBanner" style="background:#EEF2F5; color:var(--steel); padding:7px 16px; font-size:12.5px; display:flex; gap:10px; align-items:center; justify-content:center; flex-wrap:wrap; text-align:center;">
+  <span>Saved on this device only — use Export/Import to carry data to your phone.</span>
   <button class="btn small secondary" id="exportBtn">Export backup</button>
   <button class="btn small secondary" id="importBtn">Import backup</button>
 </div>
@@ -115,6 +116,7 @@
     <div class="nav">
       <button data-view="dashboard" class="active">Dashboard</button>
       <button data-view="jobs">Jobs</button>
+      <button data-view="calendar">Calendar</button>
       <button data-view="customers">Customers</button>
     </div>
     <button class="newjob" id="newJobBtn">+ New job</button>
@@ -123,53 +125,43 @@
   <nav class="bottombar">
     <button data-view="dashboard" class="active">Dashboard</button>
     <button data-view="jobs">Jobs</button>
+    <button data-view="calendar">Calendar</button>
     <button data-view="customers">Customers</button>
   </nav>
 </div>
 
 <script>
-let state = { view: 'dashboard', jobId: null, jobTab: 'overview', expandedCustomer: null, addingApplianceFor: null, newJobCustomerId: '' };
+let state = { view: 'dashboard', jobId: null, jobTab: 'overview', expandedCustomer: null, addingApplianceFor: null, newJobCustomerId: '', pendingEvent: null };
 let jobCache = {};
 let badgeImageData = null; // {base64, mediaType} for the appliance form currently open
 
 function uid(prefix){ return prefix + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2,7); }
 function esc(s){ return (s||'').toString().replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
-// ---- Storage layer: uses cloud storage when it works, falls back to in-page
-// memory (with manual export/import backup) when it doesn't ----
-let usingFallback = false;
-const memStore = {};
-
-function enableFallback(){
-  if(usingFallback) return;
-  usingFallback = true;
-  const banner = document.getElementById('fallbackBanner');
-  if(banner) banner.classList.remove('hidden');
-}
+// ---- Storage layer: this device's own browser storage. Reliable now that the
+// app runs from a real hosted address, but it's per-device — that's what the
+// Export/Import backup is for (moving data to another device). ----
+const LS_PREFIX = 'callout:';
 async function dbGet(key){
-  if(!usingFallback){
-    try{ const r = await window.storage.get(key, false); if(r) return r; }
-    catch(err){ console.error('storage get failed, switching to in-page storage', err); enableFallback(); }
-  }
-  return memStore.hasOwnProperty(key) ? { key, value: memStore[key] } : null;
+  try{ const v = localStorage.getItem(LS_PREFIX+key); return v!==null ? { key, value:v } : null; }
+  catch(err){ console.error('storage get failed', err); return null; }
 }
 async function dbSet(key, value){
-  if(!usingFallback){
-    try{
-      const res = await window.storage.set(key, value, false);
-      if(res){ memStore[key] = value; return res; }
-      throw new Error('no response');
-    }catch(err){ console.error('storage set failed, switching to in-page storage', err); enableFallback(); }
-  }
-  memStore[key] = value;
-  return { key, value };
+  try{ localStorage.setItem(LS_PREFIX+key, value); return { key, value }; }
+  catch(err){ console.error('storage set failed', err); alert('Could not save — your browser storage may be full or blocked (private browsing can cause this).'); return null; }
 }
 async function dbList(prefix){
-  if(!usingFallback){
-    try{ const r = await window.storage.list(prefix, false); if(r) return r; }
-    catch(err){ console.error('storage list failed, switching to in-page storage', err); enableFallback(); }
-  }
-  return { keys: Object.keys(memStore).filter(k => !prefix || k.startsWith(prefix)) };
+  try{
+    const keys = [];
+    for(let i=0;i<localStorage.length;i++){
+      const k = localStorage.key(i);
+      if(k && k.startsWith(LS_PREFIX)){
+        const bare = k.slice(LS_PREFIX.length);
+        if(!prefix || bare.startsWith(prefix)) keys.push(bare);
+      }
+    }
+    return { keys };
+  }catch(err){ console.error('storage list failed', err); return { keys: [] }; }
 }
 
 async function loadAll(prefix){
@@ -192,27 +184,34 @@ async function saveJob(job){ jobCache[job.id] = job; return await dbSet('job:'+j
 async function saveCustomer(c){ return await dbSet('customer:'+c.id, JSON.stringify(c)); }
 async function saveAppliance(a){ return await dbSet('appliance:'+a.id, JSON.stringify(a)); }
 
-// ---- Backup / restore (used automatically when cloud storage is unavailable) ----
+// ---- Backup / restore (moves data between devices, since storage is per-device) ----
+function collectAllData(){
+  const out = {};
+  for(let i=0;i<localStorage.length;i++){
+    const k = localStorage.key(i);
+    if(k && k.startsWith(LS_PREFIX)) out[k.slice(LS_PREFIX.length)] = localStorage.getItem(k);
+  }
+  return out;
+}
 function showExportOverlay(){
   document.getElementById('backupOverlay').classList.remove('hidden');
   document.getElementById('backupTitle').textContent = 'Export backup';
-  const json = JSON.stringify(memStore);
+  const json = JSON.stringify(collectAllData());
   document.getElementById('backupBody').innerHTML =
-    `<p class="note">Copy everything in this box and paste it somewhere safe (a notes app is fine). Use Import backup to bring it back later, including in a fresh copy of this page.</p>
+    `<p class="note">Copy everything in this box and paste it somewhere safe, or straight into Import backup on your other device.</p>
      <textarea readonly rows="10" style="font-family:monospace; font-size:12px;" onclick="this.select()">${esc(json)}</textarea>`;
 }
 function showImportOverlay(){
   document.getElementById('backupOverlay').classList.remove('hidden');
   document.getElementById('backupTitle').textContent = 'Import backup';
   document.getElementById('backupBody').innerHTML =
-    `<p class="note">Paste a previously exported backup below, then load it.</p>
+    `<p class="note">Paste a previously exported backup below, then load it. This adds to what's already here (matching records are overwritten).</p>
      <textarea id="importBox" rows="10" style="font-family:monospace; font-size:12px;"></textarea>
      <button class="btn safety small" id="loadBackupBtn" style="margin-top:8px;">Load backup</button>`;
   document.getElementById('loadBackupBtn').addEventListener('click', ()=>{
     try{
       const parsed = JSON.parse(document.getElementById('importBox').value);
-      Object.assign(memStore, parsed);
-      enableFallback();
+      Object.entries(parsed).forEach(([k,v])=> localStorage.setItem(LS_PREFIX+k, v));
       document.getElementById('backupOverlay').classList.add('hidden');
       alert('Backup loaded.');
       render();
@@ -222,6 +221,70 @@ function showImportOverlay(){
 document.getElementById('exportBtn').addEventListener('click', showExportOverlay);
 document.getElementById('importBtn').addEventListener('click', showImportOverlay);
 document.getElementById('closeBackupBtn').addEventListener('click', ()=> document.getElementById('backupOverlay').classList.add('hidden'));
+
+// ---- Google Calendar ----
+const GOOGLE_CLIENT_ID = '65416956502-1grdlilp1crjkfnqsr9vhtorenj6fa9g.apps.googleusercontent.com';
+let gcalToken = null;
+let gcalTokenClient = null;
+let lastCalEvents = [];
+function ensureTokenClient(){
+  if(gcalTokenClient) return gcalTokenClient;
+  gcalTokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: GOOGLE_CLIENT_ID,
+    scope: 'https://www.googleapis.com/auth/calendar.readonly',
+    callback: (resp)=>{ if(resp && resp.access_token){ gcalToken = resp.access_token; render(); } }
+  });
+  return gcalTokenClient;
+}
+function connectCalendar(){ ensureTokenClient().requestAccessToken(); }
+function disconnectCalendar(){
+  if(gcalToken && window.google && google.accounts.oauth2.revoke) google.accounts.oauth2.revoke(gcalToken, ()=>{});
+  gcalToken = null; render();
+}
+async function fetchCalendarEvents(){
+  if(!gcalToken) return [];
+  const timeMin = new Date().toISOString();
+  const url = `https://www.googleapis.com/calendar/v3/events?calendarId=primary&timeMin=${encodeURIComponent(timeMin)}&maxResults=20&singleEvents=true&orderBy=startTime`;
+  const resp = await fetch(url, { headers:{ Authorization: 'Bearer '+gcalToken } });
+  if(resp.status===401){ gcalToken=null; throw new Error('Your Google session expired — reconnect.'); }
+  if(!resp.ok) throw new Error('Could not load calendar events.');
+  const data = await resp.json();
+  return data.items || [];
+}
+async function renderCalendar(main){
+  main.innerHTML = `<div class="pagehead"><h1>Calendar</h1></div><div class="card" id="calCard"><div class="empty">Loading…</div></div>`;
+  const card = document.getElementById('calCard');
+  if(!gcalToken){
+    card.innerHTML = `<p class="note">Connect your Google Calendar to see upcoming bookings here and turn any of them into a job folder.</p>
+      <button class="btn safety" id="connectCalBtn">Connect Google Calendar</button>`;
+    document.getElementById('connectCalBtn').addEventListener('click', connectCalendar);
+    return;
+  }
+  try{
+    lastCalEvents = await fetchCalendarEvents();
+    if(!lastCalEvents.length){
+      card.innerHTML = `<div class="empty">No upcoming events found on your calendar.</div><button class="btn secondary small" id="disconnectCalBtn" style="margin-top:10px;">Disconnect</button>`;
+    } else {
+      card.innerHTML = lastCalEvents.map((ev,i)=>{
+        const start = (ev.start && (ev.start.dateTime || ev.start.date)) || '';
+        return `<div class="joblist-item">
+          <div class="jl-left"><div class="cust">${esc(ev.summary)||'(no title)'}</div>
+          <div class="meta">${esc(start)} ${ev.location? '· '+esc(ev.location):''}</div></div>
+          <button class="btn small safety usejob-btn" data-i="${i}">Use for new job</button>
+        </div>`;
+      }).join('') + `<button class="btn secondary small" id="disconnectCalBtn" style="margin-top:10px;">Disconnect</button>`;
+      card.querySelectorAll('.usejob-btn').forEach(btn=> btn.addEventListener('click', ()=>{
+        state.pendingEvent = lastCalEvents[parseInt(btn.dataset.i)];
+        setView('newjob');
+      }));
+    }
+  }catch(err){
+    console.error('calendar load failed', err);
+    card.innerHTML = `<div class="empty">${esc(err.message||'Could not load events.')}</div><button class="btn safety small" id="connectCalBtn" style="margin-top:10px;">Reconnect</button>`;
+    document.getElementById('connectCalBtn').addEventListener('click', connectCalendar);
+  }
+  const dc = document.getElementById('disconnectCalBtn'); if(dc) dc.addEventListener('click', disconnectCalendar);
+}
 
 // ---- AI helpers (vision scan + web search for manuals) ----
 async function callClaude(messages, tools){
@@ -336,6 +399,7 @@ async function render(){
   const main = document.getElementById('main');
   if(state.view === 'dashboard') return renderDashboard(main);
   if(state.view === 'jobs') return renderJobsList(main);
+  if(state.view === 'calendar') return renderCalendar(main);
   if(state.view === 'customers') return renderCustomers(main);
   if(state.view === 'newjob') return renderNewJob(main);
   if(state.view === 'job') return renderJobDetail(main);
@@ -387,6 +451,7 @@ async function renderCustomers(main){
         <div class="field"><label>Name</label><input id="c_name"></div>
         <div class="field"><label>Phone</label><input id="c_phone"></div>
       </div>
+      <div class="field"><label>Email</label><input type="email" id="c_email"></div>
       <div class="field"><label>Address</label><input id="c_address"></div>
       <div class="field"><label>Notes</label><textarea id="c_notes" rows="2"></textarea></div>
       <button class="btn safety" id="addCustomerBtn">Add customer</button>
@@ -397,7 +462,7 @@ async function renderCustomers(main){
     const name = document.getElementById('c_name').value.trim();
     const address = document.getElementById('c_address').value.trim();
     if(!name || !address){ alert('Name and address are required.'); return; }
-    const c = { id: uid('cust'), name, phone: document.getElementById('c_phone').value.trim(), address, notes: document.getElementById('c_notes').value.trim() };
+    const c = { id: uid('cust'), name, phone: document.getElementById('c_phone').value.trim(), email: document.getElementById('c_email').value.trim(), address, notes: document.getElementById('c_notes').value.trim() };
     const saved = await saveCustomer(c);
     if(saved) renderCustomers(main);
   });
@@ -409,7 +474,7 @@ async function renderCustomers(main){
     const expanded = state.expandedCustomer === c.id;
     return `<div class="customer-card">
       <div class="customer-head" data-id="${c.id}">
-        <div><div class="name">${esc(c.name)}</div><div class="meta">${esc(c.address)}</div></div>
+        <div><div class="name">${esc(c.name)}</div><div class="meta">${esc(c.address)}${c.email? ' · '+esc(c.email):''}</div></div>
         <div class="meta">${theirAppliances.length} appliance${theirAppliances.length===1?'':'s'}</div>
       </div>
       <div class="customer-body ${expanded?'':'hidden'}">
@@ -558,8 +623,16 @@ async function renderNewJob(main){
   const selectedId = state.newJobCustomerId;
   const appliances = selectedId ? (await loadAll('appliance:')).filter(a=>a.customerId===selectedId) : [];
   const selectedCustomer = customers.find(c=>c.id===selectedId);
+  const ev = state.pendingEvent; state.pendingEvent = null;
+  let prefillDate='', prefillTime='', prefillNotes='';
+  if(ev){
+    const dt = ev.start && (ev.start.dateTime || ev.start.date);
+    if(dt){ const d = new Date(dt); if(!isNaN(d)){ prefillDate = d.toISOString().slice(0,10); if(ev.start.dateTime) prefillTime = d.toTimeString().slice(0,5); } }
+    prefillNotes = `From calendar: ${ev.summary||'(no title)'}${ev.location? ' @ '+ev.location:''}`;
+  }
   main.innerHTML = `
     <div class="pagehead"><h1>New job</h1></div>
+    ${ev ? `<div class="card note">Pre-filled from your calendar — pick which customer this booking is for below.</div>` : ''}
     <div class="card">
       ${!customers.length ? `<div class="empty">No customers yet. Add one on the Customers tab first, then come back here.</div>` : `
       <div class="field"><label>Customer</label>
@@ -570,8 +643,8 @@ async function renderNewJob(main){
       </div>
       ${selectedCustomer ? `<div class="note">${esc(selectedCustomer.address)} ${selectedCustomer.phone? '· '+esc(selectedCustomer.phone):''}</div><div class="divider"></div>` : ''}
       <div class="grid3">
-        <div class="field"><label>Date</label><input type="date" id="j_date"></div>
-        <div class="field"><label>Time</label><input type="time" id="j_time"></div>
+        <div class="field"><label>Date</label><input type="date" id="j_date" value="${esc(prefillDate)}"></div>
+        <div class="field"><label>Time</label><input type="time" id="j_time" value="${esc(prefillTime)}"></div>
         <div class="field"><label>Job type</label><select id="j_type">${JOB_TYPES.map(t=>`<option>${t}</option>`).join('')}</select></div>
       </div>
       <div class="field"><label>Appliance</label>
@@ -581,7 +654,7 @@ async function renderNewJob(main){
         </select>
         ${selectedId && !appliances.length ? '<div class="note">This customer has no appliances on file yet — add one from the Customers tab.</div>' : ''}
       </div>
-      <div class="field"><label>Notes</label><textarea id="j_notes" rows="2"></textarea></div>
+      <div class="field"><label>Notes</label><textarea id="j_notes" rows="2">${esc(prefillNotes)}</textarea></div>
       <button class="btn safety" id="createJobBtn">Create job folder</button>
       `}
     </div>
