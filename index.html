@@ -96,6 +96,24 @@
     .bottombar button{ all:unset; flex:1; text-align:center; padding:12px 4px 10px; color:#C6CACF; font-size:12.5px; cursor:pointer; border-top:2px solid transparent; }
     .bottombar button.active{ color:#fff; font-weight:700; border-top:2px solid var(--safety); }
   }
+  #printArea{ display:none; }
+  .pr-note{ font-size:11.5px; color:var(--muted); margin:4px 0 14px; }
+  .pr-table{ width:100%; border-collapse:collapse; margin-bottom:14px; font-size:12.5px; }
+  .pr-table th{ background:#EEE; text-align:left; padding:5px 8px; border:1px solid #999; }
+  .pr-table td{ padding:4px 8px; border:1px solid #999; }
+  .pr-table td:nth-child(odd){ width:40%; color:#333; font-weight:600; }
+  .pr-grid{ width:100%; border-collapse:collapse; margin-bottom:14px; font-size:10.5px; }
+  .pr-grid th{ background:#EEE; text-align:left; padding:4px 5px; border:1px solid #999; }
+  .pr-grid td{ padding:4px 5px; border:1px solid #999; }
+  .comb-row{ margin-bottom:10px; }
+  .comb-row label{ display:block; font-size:12.5px; color:var(--muted); font-weight:600; margin-bottom:4px; }
+  .comb-inputs{ display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  @media print{
+    body *{ visibility:hidden; }
+    #printArea, #printArea *{ visibility:visible; }
+    #printArea{ display:block; position:absolute; left:0; top:0; width:100%; padding:20px; }
+    #printArea h1{ font-size:22px; margin-bottom:4px; }
+  }
 </style>
 </head>
 <body>
@@ -109,6 +127,19 @@
     <h2 id="backupTitle" style="font-size:18px; margin-bottom:10px;"></h2>
     <div id="backupBody"></div>
     <button class="btn secondary small" id="closeBackupBtn" style="margin-top:12px;">Close</button>
+  </div>
+</div>
+<div id="printArea"></div>
+<div id="recordOverlay" class="hidden" style="position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:60; display:flex; align-items:center; justify-content:center; padding:16px;">
+  <div class="card" style="max-width:760px; width:100%; max-height:90vh; overflow:auto;">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; gap:8px; flex-wrap:wrap;">
+      <h2 style="font-size:18px;" id="recordOverlayTitle">Safety record preview</h2>
+      <div style="display:flex; gap:8px;">
+        <button class="btn safety small" id="printFromPreviewBtn">Print / Save as PDF</button>
+        <button class="btn secondary small" id="closeRecordBtn">Close</button>
+      </div>
+    </div>
+    <div id="recordOverlayBody"></div>
   </div>
 </div>
 <div class="app">
@@ -132,9 +163,11 @@
 </div>
 
 <script>
-let state = { view: 'dashboard', jobId: null, jobTab: 'overview', expandedCustomer: null, addingApplianceFor: null, newJobCustomerId: '', pendingEvent: null };
+let state = { view: 'dashboard', jobId: null, jobTab: 'overview', expandedCustomer: null, addingApplianceFor: null, newJobCustomerId: '', pendingEvent: null, editingJob: false, completionApplianceKey: null };
 let jobCache = {};
 let badgeImageData = null; // {base64, mediaType} for the appliance form currently open
+let manualSearchResult = null; // last findManualOnline() result for the appliance form currently open
+let editingAppliance = null; // the existing appliance record being edited, or null when adding a new one
 
 function uid(prefix){ return prefix + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2,7); }
 function esc(s){ return (s||'').toString().replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -194,29 +227,72 @@ function collectAllData(){
   }
   return out;
 }
+async function copyText(text){
+  try{ await navigator.clipboard.writeText(text); return true; }
+  catch(e){
+    try{
+      const ta = document.createElement('textarea');
+      ta.value = text; ta.style.position='fixed'; ta.style.left='-9999px';
+      document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta);
+      return true;
+    }catch(e2){ return false; }
+  }
+}
+function downloadBackup(json){
+  const blob = new Blob([json], { type:'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'callout-backup-'+new Date().toISOString().slice(0,10)+'.json';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(()=> URL.revokeObjectURL(url), 2000);
+}
 function showExportOverlay(){
   document.getElementById('backupOverlay').classList.remove('hidden');
   document.getElementById('backupTitle').textContent = 'Export backup';
   const json = JSON.stringify(collectAllData());
   document.getElementById('backupBody').innerHTML =
-    `<p class="note">Copy everything in this box and paste it somewhere safe, or straight into Import backup on your other device.</p>
-     <textarea readonly rows="10" style="font-family:monospace; font-size:12px;" onclick="this.select()">${esc(json)}</textarea>`;
+    `<p class="note">Easiest option: download it as a file, then use "Import backup" \u2192 "Choose file" on your other device. Copy-to-clipboard also works but can be slow with a lot of data (photos especially).</p>
+     <div style="display:flex; gap:8px; margin-bottom:10px;">
+       <button class="btn safety small" id="downloadBackupBtn">Download backup file</button>
+       <button class="btn secondary small" id="copyBackupBtn">Copy to clipboard</button>
+     </div>
+     <div class="note" id="copyStatus"></div>
+     <details style="margin-top:8px;"><summary class="note" style="cursor:pointer;">Show raw text (manual copy)</summary>
+       <textarea readonly rows="8" style="font-family:monospace; font-size:12px; margin-top:6px;" onclick="this.select()">${esc(json)}</textarea>
+     </details>`;
+  document.getElementById('downloadBackupBtn').addEventListener('click', ()=> downloadBackup(json));
+  document.getElementById('copyBackupBtn').addEventListener('click', async ()=>{
+    const ok = await copyText(json);
+    document.getElementById('copyStatus').textContent = ok ? 'Copied — paste it somewhere safe.' : "Couldn't copy automatically — use Download instead, or the raw text box below.";
+  });
 }
 function showImportOverlay(){
   document.getElementById('backupOverlay').classList.remove('hidden');
   document.getElementById('backupTitle').textContent = 'Import backup';
   document.getElementById('backupBody').innerHTML =
-    `<p class="note">Paste a previously exported backup below, then load it. This adds to what's already here (matching records are overwritten).</p>
-     <textarea id="importBox" rows="10" style="font-family:monospace; font-size:12px;"></textarea>
-     <button class="btn safety small" id="loadBackupBtn" style="margin-top:8px;">Load backup</button>`;
-  document.getElementById('loadBackupBtn').addEventListener('click', ()=>{
+    `<p class="note">Choose a previously downloaded backup file, or paste one below. This adds to what's already here (matching records are overwritten).</p>
+     <input type="file" accept=".json,application/json" id="importFile" style="margin-bottom:10px;">
+     <details><summary class="note" style="cursor:pointer;">Paste instead</summary>
+       <textarea id="importBox" rows="8" style="font-family:monospace; font-size:12px; margin-top:6px;"></textarea>
+       <button class="btn safety small" id="loadBackupBtn" style="margin-top:8px;">Load pasted backup</button>
+     </details>`;
+  function loadBackupData(parsed){
     try{
-      const parsed = JSON.parse(document.getElementById('importBox').value);
       Object.entries(parsed).forEach(([k,v])=> localStorage.setItem(LS_PREFIX+k, v));
       document.getElementById('backupOverlay').classList.add('hidden');
       alert('Backup loaded.');
       render();
-    }catch(err){ alert("That didn't look like a valid backup — check you copied the whole thing."); }
+    }catch(err){ alert("That didn't look like a valid backup."); }
+  }
+  document.getElementById('importFile').addEventListener('change', (e)=>{
+    const file = e.target.files[0]; if(!file) return;
+    const reader = new FileReader();
+    reader.onload = () => { try{ loadBackupData(JSON.parse(reader.result)); }catch(err){ alert("That file didn't look like a valid backup."); } };
+    reader.readAsText(file);
+  });
+  document.getElementById('loadBackupBtn').addEventListener('click', ()=>{
+    try{ loadBackupData(JSON.parse(document.getElementById('importBox').value)); }
+    catch(err){ alert("That didn't look like a valid backup — check you copied the whole thing."); }
   });
 }
 document.getElementById('exportBtn').addEventListener('click', showExportOverlay);
@@ -252,7 +328,7 @@ function ensureTokenClient(){
   if(gcalTokenClient) return gcalTokenClient;
   gcalTokenClient = google.accounts.oauth2.initTokenClient({
     client_id: GOOGLE_CLIENT_ID,
-    scope: 'https://www.googleapis.com/auth/calendar.readonly',
+    scope: 'https://www.googleapis.com/auth/calendar.events',
     callback: (resp)=>{ if(resp && resp.access_token){ gcalToken = resp.access_token; render(); } }
   });
   return gcalTokenClient;
@@ -274,7 +350,7 @@ async function fetchCalendarEvents(){
       singleEvents: true,
       orderBy: 'startTime'
     });
-    return (resp.result && resp.result.items) || [];
+    return ((resp.result && resp.result.items) || []).filter(ev => ev.eventType !== 'birthday');
   }catch(err){
     console.error('calendar api error', err);
     if(err.status === 401){ gcalToken = null; throw new Error('Your Google session expired — reconnect.'); }
@@ -319,15 +395,18 @@ async function renderCalendar(main){
 
 // ---- AI helpers (vision scan + web search for manuals) ----
 async function callClaude(messages, tools){
-  const body = { model: "claude-sonnet-4-6", max_tokens: 1024, messages };
+  const body = { model: "claude-sonnet-4-6", max_tokens: 1500, messages };
   if(tools) body.tools = tools;
   const resp = await fetch("https://api.anthropic.com/v1/messages", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body) });
   return await resp.json();
 }
 function extractJson(text){
-  const clean = text.replace(/```json|```/g,'').trim();
-  const start = clean.indexOf('{'); const end = clean.lastIndexOf('}');
-  return JSON.parse(clean.slice(start, end+1));
+  if(!text) throw new Error('No response text from AI.');
+  const clean = text.replace(/```json|```/gi,'').trim();
+  const match = clean.match(/\{[\s\S]*\}/);
+  if(!match) throw new Error("AI didn't return readable data.");
+  try{ return JSON.parse(match[0]); }
+  catch(e){ throw new Error("AI response wasn't valid data."); }
 }
 async function scanBadgePhoto(base64, mediaType){
   const data = await callClaude([{ role:"user", content:[
@@ -338,11 +417,96 @@ async function scanBadgePhoto(base64, mediaType){
   if(!block) throw new Error('no text in response');
   return extractJson(block.text);
 }
-async function findManualOnline(make, model){
-  const data = await callClaude([{ role:"user", content:
-    `Find the official manufacturer installation and user instructions PDF for the "${make} ${model}" boiler/appliance. Reply with ONLY a JSON object: {"url":"","note":""}. Prefer a direct link from the manufacturer's own site. If none found, leave url empty and say why in note (one short sentence).` }],
-    [{ type:"web_search_20250305", name:"web_search" }]
-  );
+async function scanAnalyserPrintout(base64, mediaType){
+  const fieldList = COMBUSTION_FIELDS.map(([key])=>key).join(', ');
+  const data = await callClaude([{ role:"user", content:[
+    { type:"image", source:{ type:"base64", media_type: mediaType, data: base64 } },
+    { type:"text", text:
+`This is a printout or photo from a flue gas combustion analyser. Read the values and map them to this exact set of JSON keys: ${fieldList}.
+
+Typical mappings (analyser label → key): PRS/draught pressure → draughtPressureMbar (NOT burnerPressureMbar — that's a separate manual gas-pressure reading the analyser doesn't take); T1/flue gas temp → flueGasTempC; T2 or Ta/ambient → roomTempC; NETT/net flue temp → flueGasTempNetC; O2 → o2Pct; CO2 → co2Pct; CO → coPpm (if the printout shows CO as a percentage, convert it to ppm by multiplying by 10000); NOx or NOx(n) → noxPct (this is actually a ppm reading despite the key name); CO/CO2 → coCo2Ratio; XAIR/excess air → excessAirPct; EFFnc or EFFgr/efficiency → grossEfficiencyPct; CO flue dilution → coFlueDilutionPpm. Heat input rate, gas rate, and burner/gas pressure are not shown on an analyser printout — always leave burnerPressureMbar blank and only fill heat input/gas rate if clearly printed.
+
+Reply with ONLY a JSON object using exactly those keys, empty string "" for anything not shown or not legible. No other text.` }
+  ]}]);
+  const block = (data.content||[]).find(c=>c.type==='text');
+  if(!block) throw new Error('no text in response');
+  return extractJson(block.text);
+}
+
+// ---- Analyser JSON export import (e.g. KANE and similar devices) ----
+const ANALYSER_KEY_MAP = {
+  'PRS': { key:'draughtPressureMbar' },
+  'T1': { key:'flueGasTempC' },
+  'Ta': { key:'roomTempC' },
+  'T2': { key:'roomTempC' },
+  'NETT': { key:'flueGasTempNetC' },
+  'O2': { key:'o2Pct' },
+  'CO2': { key:'co2Pct' },
+  'CO': { key:'coPpm', convertPctToPpm:true },
+  'NOx': { key:'noxPct' },
+  'NOx(n)': { key:'noxPct' },
+  'XAIR': { key:'excessAirPct' },
+  'EFFnc': { key:'grossEfficiencyPct' },
+  'EFFgr': { key:'grossEfficiencyPct' },
+  'CO/CO2': { key:'coCo2Ratio' }
+};
+function isUsableReading(val){
+  if(val===undefined || val===null) return false;
+  const s = String(val).trim();
+  if(!s) return false;
+  if(s.includes('-')) return false;
+  if(/[A-Za-z]/.test(s)) return false;
+  return true;
+}
+function parseAnalyserJson(text){
+  const data = JSON.parse(text);
+  if(!Array.isArray(data)) throw new Error('Expected a list of readings.');
+  return data.filter(e => e.report_details && e.report_details.report_type === 'COMBUSTION' && e.report_data && Array.isArray(e.report_data.COMBUSTION));
+}
+function mapAnalyserReading(entry){
+  const out = {};
+  entry.report_data.COMBUSTION.forEach(item=>{
+    const map = ANALYSER_KEY_MAP[item.key];
+    if(!map) return;
+    if(!isUsableReading(item.value)) return;
+    let val = String(item.value).trim();
+    if(map.convertPctToPpm && item.unit === '%'){
+      const num = parseFloat(val);
+      if(!isNaN(num)) val = String(Math.round(num*10000));
+    }
+    out[map.key] = val;
+  });
+  return out;
+}
+async function findManualOnline(make, model, imageData, serial){
+  const serialLine = serial ? ` The unit's serial number is ${serial}.` : '';
+  const instructions = `Find the official manufacturer installation, commissioning and maintenance manual for this appliance.${serialLine} Search thoroughly, including the manufacturer's own downloads/manuals page and any other indexed sources.
+
+Reply with ONLY a JSON object with exactly these fields:
+{"url":"","documentType":"","manufacturerWebsite":"","manufacturerPhone":"","manufacturerEmail":"","note":""}
+
+- "url": a direct link to the full installation/commissioning/maintenance manual PDF, if you can find one. Leave empty if you only found a data sheet, brochure, or spec sheet rather than a full manual.
+- "documentType": what "url" actually is, e.g. "full installation & maintenance manual". Leave empty if url is empty.
+- "manufacturerWebsite", "manufacturerPhone", "manufacturerEmail": the manufacturer's own contact details, filled in wherever you can find them — do this even if you couldn't find a full manual, since it's useful on its own.
+- "note": ALWAYS fill this in, 2-4 sentences. Say what you actually checked (which pages/sources), what you found even if it's only a data sheet or brochure (name it and give its link), and why a full manual couldn't be confirmed if that's the case. If contacting the manufacturer directly is the practical next step — for example because manuals are issued per-unit or the model is older — say so plainly, mention the serial number if one was given, and note any phone/email you found. Be genuinely useful here: the engineer shouldn't have to repeat searches you've already done.`;
+  const content = [];
+  if(imageData){
+    content.push({ type:"image", source:{ type:"base64", media_type: imageData.mediaType, data: imageData.base64 } });
+    content.push({ type:"text", text:
+      `This is a photo of a boiler/appliance data badge. Read the exact make, model and any model code straight from the photo yourself — don't just rely on the typed reference below, which may be incomplete or slightly wrong. Typed reference: make="${make}", model="${model}".\n\n${instructions}` });
+  } else {
+    content.push({ type:"text", text: `Appliance: "${make} ${model}".\n\n${instructions}` });
+  }
+  const data = await callClaude([{ role:"user", content }], [{ type:"web_search_20250305", name:"web_search" }]);
+  const block = (data.content||[]).filter(c=>c.type==='text').pop();
+  if(!block) throw new Error('no text in response');
+  return extractJson(block.text);
+}
+async function findManualSection(make, model, manualUrl, jobType){
+  const topic = JOB_TYPE_MANUAL_TOPIC[jobType] || 'the relevant section for this job';
+  const content = [{ type:"text", text:
+    `Look at the manufacturer's installation and servicing manual for the ${make} ${model} — it should be at or near this URL: ${manualUrl}. Find the chapter/section title and page number that covers ${topic}. Reply with ONLY a JSON object: {"chapter":"","page":"","note":""}. Only fill in "page" if you can actually confirm it from the document's contents page or headings — if you can't be sure, leave "page" empty and briefly say why in "note" (one short sentence). Keep "chapter" to the section title only.` }];
+  const data = await callClaude([{ role:"user", content }], [{ type:"web_search_20250305", name:"web_search" }]);
   const block = (data.content||[]).filter(c=>c.type==='text').pop();
   if(!block) throw new Error('no text in response');
   return extractJson(block.text);
@@ -372,12 +536,42 @@ function compressImage(file, maxDim, quality){
 
 // ---- nav / view state ----
 function syncNavActive(view){ document.querySelectorAll('[data-view]').forEach(b=> b.classList.toggle('active', b.dataset.view===view)); }
-function setView(v, jobId){ state.view=v; state.jobId=jobId||null; state.jobTab='overview'; syncNavActive(v); render(); }
+function setView(v, jobId){ state.view=v; state.jobId=jobId||null; state.jobTab='overview'; state.editingJob=false; state.completionApplianceKey=null; syncNavActive(v); render(); }
 document.querySelectorAll('[data-view]').forEach(b=> b.addEventListener('click', ()=> setView(b.dataset.view)));
 document.getElementById('newJobBtn').addEventListener('click', ()=> setView('newjob'));
 
 const JOB_TYPES = ['Service','Repair / Breakdown','Installation','Landlord Gas Safety Record','Boiler Change'];
-const APPLIANCE_TYPES = ['Gas Combi Boiler','Gas System Boiler','Gas Regular (Heat-only) Boiler','Gas Back Boiler','LPG Boiler','OFTEC Oil Combi Boiler','OFTEC Oil Regular Boiler','Electric Boiler','Other appliance'];
+const JOB_TYPE_MANUAL_TOPIC = {
+  'Service': 'the routine servicing / annual maintenance schedule',
+  'Repair / Breakdown': 'fault finding, fault codes, or diagnostics',
+  'Installation': 'installation instructions',
+  'Landlord Gas Safety Record': 'the routine servicing / maintenance schedule and safety checks',
+  'Boiler Change': 'installation instructions'
+};
+const FLUE_TYPE_LABELS = {
+  'room-sealed': 'Room-sealed / balanced flue',
+  'open-direct': 'Open flue — natural draught, with draught diverter',
+  'open-fanned': 'Open flue — fan assisted, no draught diverter ("conventional flue")',
+  'open-compartment': 'Open flue — via cupboard/compartment',
+  'flueless': 'Flueless'
+};
+const APPLIANCE_TYPES = [
+  'Gas Combi Boiler','Gas System Boiler','Gas Regular (Heat-only) Boiler','Gas Back Boiler','LPG Boiler',
+  'Commercial/Industrial Packaged Boiler','Steam Boiler',
+  'OFTEC Oil Combi Boiler','OFTEC Oil Regular Boiler','Electric Boiler',
+  'Radiant Tube Heater','Radiant Plaque Heater',
+  'High Level Warm Air Unit','Floor Level Warm Air Unit','Direct Fired Warm Air Heater','Indirect Fired Warm Air Heater (Unit Heater)',
+  'Direct Fired Process Burner','Water Bath Process Burner','AHU Burner (Air Handling Unit)','Duct Heater','Rooftop Package Unit',
+  'Gas Fired Water Heater','Commercial Catering Equipment','LPG Vaporiser',
+  'Other appliance'
+];
+const COMBUSTION_FIELDS = [
+  ['heatInputKW','Heat input rate (kW)'], ['burnerPressureMbar','Gas pressure (mbar, manual)'], ['gasRateM3hr','Rate of gas (m³/hr)'],
+  ['roomTempC','Room temperature (°C)'], ['flueGasTempC','Flue gas temperature (°C)'], ['flueGasTempNetC','Flue gas temp NET (°C)'],
+  ['draughtPressureMbar','Draught pressure (mbar)'], ['o2Pct','Oxygen O₂ (%)'], ['coPpm','Carbon monoxide CO (ppm)'],
+  ['co2Pct','Carbon dioxide CO₂ (%)'], ['coCo2Ratio','CO/CO₂ ratio'], ['noxPct','NOx (ppm)'],
+  ['excessAirPct','Excess air (%)'], ['grossEfficiencyPct','Gross efficiency (%)'], ['coFlueDilutionPpm','CO flue dilution (ppm)']
+];
 const HAZARDS_BY_TYPE = {
   'Service': ['Carbon monoxide exposure','Gas isolation / leak on reconnection','Hot surfaces & components','Manual handling'],
   'Repair / Breakdown': ['Carbon monoxide exposure','Live gas work / leak risk','Electric shock (isolate power)','Hot surfaces & components','Manual handling'],
@@ -385,13 +579,25 @@ const HAZARDS_BY_TYPE = {
   'Landlord Gas Safety Record': ['Carbon monoxide exposure','Access to multiple appliances','Tenant / occupant interaction'],
   'Boiler Change': ['Manual handling (appliance weight)','Working at height (flue run)','Gas isolation during connection','Electrical connection','Hot surfaces on removed unit']
 };
-function ramsTemplate(job, appliance){
+function ramsTemplate(job, appliances, manualRefs){
+  appliances = appliances || [];
+  manualRefs = manualRefs || {};
   const hazards = HAZARDS_BY_TYPE[job.jobType] || HAZARDS_BY_TYPE['Service'];
-  const applianceLine = appliance ? `${appliance.make} ${appliance.model} (${appliance.applianceType}), serial ${appliance.serial||'not recorded'}` : 'appliance not yet linked';
+  const applianceLines = appliances.length
+    ? appliances.map(a=>{
+        const ref = manualRefs[a.id];
+        const refLine = ref && (ref.chapter || ref.page)
+          ? ` — manual reference: ${ref.chapter||'see manual'}${ref.page?', page '+ref.page:''}`
+          : '';
+        return `- ${a.make} ${a.model} (${a.applianceType}), serial ${a.serial||'not recorded'}${refLine}`;
+      }).join('\n')
+    : '- appliance not yet linked';
+  const applianceNameList = appliances.length ? appliances.map(a=>a.make+' '+a.model).join(', ') : 'the appliance(s)';
   return `RISK ASSESSMENT & METHOD STATEMENT
 Job: ${job.jobType} — ${job.customerName}
 Site address: ${job.address}
-Appliance: ${applianceLine}
+Appliance(s):
+${applianceLines}
 Date: ${job.date || '(not set)'}
 
 IDENTIFIED HAZARDS
@@ -402,27 +608,148 @@ CONTROL MEASURES
 - Isolate electrical supply to the appliance before opening electrical connections.
 - Ventilate the work area; do not work alone if CO exposure risk is elevated.
 - Use appropriate PPE: gloves, eye protection; safety footwear on site.
-- Test for gas soundness before leaving the appliance live (tightness test).
+- Test for gas soundness before leaving each appliance live (tightness test).
 - Carry a calibrated CO alarm / analyser and portable CO detector during works.
 - Follow safe manual handling technique for appliance movement; use second person for lifts over 20kg.
 - Keep escape routes and work area clear of trip hazards.
 
 METHOD STATEMENT (SUMMARY)
 1. Arrive on site, introduce yourself, confirm access and isolate utilities as required.
-2. Carry out visual inspection of appliance, flue and ventilation before starting work.
-3. Complete the job in line with manufacturer instructions for ${appliance ? appliance.make+' '+appliance.model : 'the appliance'}.
-4. On completion, carry out all statutory safety checks (tightness test, flue flow, spillage, ventilation).
-5. Record results on the job completion form. If appliance is unsafe, issue warning notice and disconnect where required by regulation.
+2. Carry out visual inspection of each appliance, flue and ventilation before starting work.
+3. Complete the job in line with manufacturer instructions for ${applianceNameList}.
+4. On completion, carry out all statutory safety checks (tightness test, flue flow, spillage, ventilation) on each appliance.
+5. Record results on the job completion form for each appliance. If an appliance is unsafe, issue warning notice and disconnect where required by regulation.
 6. Leave site tidy, brief customer on outcome, and photograph completed work for the job file.
 
 This is a working draft — review and amend for site-specific hazards before use.`;
 }
 
+function defaultCombustionReadings(){
+  return { heatInputKW:'', burnerPressureMbar:'', gasRateM3hr:'', roomTempC:'', flueGasTempC:'', flueGasTempNetC:'', draughtPressureMbar:'', o2Pct:'', coPpm:'', co2Pct:'', noxPct:'', excessAirPct:'', coCo2Ratio:'', coFlueDilutionPpm:'', grossEfficiencyPct:'' };
+}
+function defaultCompletion(){
+  return {
+    engineerName:'', regNumber:'',
+    combustion:{ low: defaultCombustionReadings(), high: defaultCombustionReadings() },
+    generalChecks:{ compressorOk:'', chimneyStandard:'', tightnessTest:'', pipeworkSupported:'', chimneyTermination:'', fanFlueInterlock:'' },
+    ventilation:{ lowerFreeAreaCm2:'', higherFreeAreaCm2:'', naturalSatisfactory:'', mechFlowInlet:'', mechFlowExtract:'', mechSatisfactory:'', calcKw:'', calcUnit:'net', calcFlueType:'' },
+    extraChecks:{ adequateVentilation:'', spillageTest:'', flueFlowTest:'', pressureSwitch:'', lockOutTime:'', tempThermostats:'', limitThermostats:'', serviced:'' },
+    pipework:{ lineDiagramPresent:'', lineDiagramCurrent:'', isolationValvesFitted:'', valveHandlesLabelled:'', pipeworkSealed:'', pipeworkColourCoded:'', electricallyBonded:'' },
+    meter:{ accessible:'', clutterFree:'', ventilated:'', secure:'', keyLabelled:'' },
+    safetyInfo:{ coAlarmPresent:'', warningNoticeIssued:'', warningLabelsAttached:'', responsiblePersonAdvised:'' },
+    workCarriedOut:'', remedialWork:'',
+    overallResult:'', remarks:'', nextInspection:''
+  };
+}
+function normalizeCompletion(c){
+  c = c || {};
+  const d = defaultCompletion();
+  const merged = Object.assign({}, d, c);
+  ['generalChecks','ventilation','extraChecks','pipework','meter','safetyInfo'].forEach(k=>{
+    merged[k] = Object.assign({}, d[k], c[k]||{});
+  });
+  if(c.combustion && (c.combustion.low || c.combustion.high)){
+    merged.combustion = { low: Object.assign({}, d.combustion.low, c.combustion.low||{}), high: Object.assign({}, d.combustion.high, c.combustion.high||{}) };
+  } else if(c.combustion){
+    merged.combustion = { low: defaultCombustionReadings(), high: Object.assign({}, d.combustion.high, c.combustion) };
+  } else {
+    merged.combustion = { low: defaultCombustionReadings(), high: defaultCombustionReadings() };
+  }
+  if(c.ventilationOk && !merged.extraChecks.adequateVentilation) merged.extraChecks.adequateVentilation = c.ventilationOk;
+  if(c.tightnessTest && !merged.generalChecks.tightnessTest) merged.generalChecks.tightnessTest = c.tightnessTest;
+  if(c.spillageTest && !merged.extraChecks.spillageTest) merged.extraChecks.spillageTest = c.spillageTest;
+  if(c.flueFlowTest && !merged.extraChecks.flueFlowTest) merged.extraChecks.flueFlowTest = c.flueFlowTest;
+  if(c.coAlarmPresent && !merged.safetyInfo.coAlarmPresent) merged.safetyInfo.coAlarmPresent = c.coAlarmPresent;
+  if(c.warningIssued && !merged.safetyInfo.warningNoticeIssued) merged.safetyInfo.warningNoticeIssued = c.warningIssued;
+  return merged;
+}
+function ensureJobShape(job){
+  // migrate single appliance -> multiple appliances
+  if(job.applianceId !== undefined){
+    if(!Array.isArray(job.applianceIds)) job.applianceIds = job.applianceId ? [job.applianceId] : [];
+    delete job.applianceId;
+  }
+  if(!Array.isArray(job.applianceIds)) job.applianceIds = [];
+
+  // migrate single completion -> one completion per appliance
+  if(job.completion){
+    const oldKey = job.applianceIds[0] || 'none';
+    if(!job.completions) job.completions = {};
+    if(!job.completions[oldKey]) job.completions[oldKey] = job.completion;
+    delete job.completion;
+  }
+  if(!job.completions || typeof job.completions !== 'object') job.completions = {};
+
+  const keys = job.applianceIds.length ? job.applianceIds.slice() : ['none'];
+  keys.forEach(k=>{ job.completions[k] = normalizeCompletion(job.completions[k]); });
+
+  if(!job.manualRefs || typeof job.manualRefs !== 'object') job.manualRefs = {};
+
+  if(job.recordType !== 'domestic') job.recordType = 'commercial';
+  job.domesticCompletion = normalizeDomesticCompletion(job.domesticCompletion, keys);
+
+  ensureInvoiceShape(job);
+  return job;
+}
+function defaultDomesticApplianceRow(){
+  return {
+    chimneyFlueType:'', landlordAppliance:'', applianceChecked:'',
+    ventilationSatisfactory:'', operatingPressureOrHeatInput:'', safetyDeviceOk:'',
+    visualConditionSatisfactory:'', chimneyFluePerformance:'',
+    combustionInitial:'', combustionFinal:'',
+    serviced:'', visualInspectionOnly:'', safeToUse:'',
+    coCorrectlyInstalled:'', coInDate:'', coTestSatisfactory:'',
+    defect:'', remedialAction:'',
+    ventCalc: { kw:'', unit:'net', flueType:'', lowerFreeAreaCm2:'', higherFreeAreaCm2:'' }
+  };
+}
+function normalizeDomesticApplianceRow(r){
+  const d = defaultDomesticApplianceRow();
+  const merged = Object.assign({}, d, r||{});
+  merged.ventCalc = Object.assign({}, d.ventCalc, (r&&r.ventCalc)||{});
+  return merged;
+}
+function defaultDomesticCompletion(){
+  return {
+    rentedAccommodation:'',
+    clientName:'', clientAddress:'', clientPostcode:'', clientTel:'',
+    applianceRows: {},
+    installationGeneral:{ ecvSatisfactory:'', pipeworkSatisfactory:'', meterCylinderSatisfactory:'', correctMaterialsUsed:'', mainBondingSatisfactory:'', tightnessTestSatisfactory:'' },
+    otherWorkCarriedOut:'', observations:'',
+    warningNoticeSerial:'', nextSafetyCheckDue:'',
+    issuedBy:{ printName:'', licenceNo:'', signed:'', issueDate:'' },
+    receivedBy:{ printName:'', signed:'', role:'', noOnePresent:false }
+  };
+}
+function normalizeDomesticCompletion(dc, applianceKeys){
+  const d = defaultDomesticCompletion();
+  dc = dc || {};
+  const merged = Object.assign({}, d, dc);
+  merged.installationGeneral = Object.assign({}, d.installationGeneral, dc.installationGeneral||{});
+  merged.issuedBy = Object.assign({}, d.issuedBy, dc.issuedBy||{});
+  merged.receivedBy = Object.assign({}, d.receivedBy, dc.receivedBy||{});
+  merged.applianceRows = {};
+  applianceKeys.forEach(k=>{ merged.applianceRows[k] = normalizeDomesticApplianceRow((dc.applianceRows||{})[k]); });
+  return merged;
+}
+function defaultInvoice(){
+  return { lineItems: [{ id: uid('li'), description:'', qty:1, unitPrice:'' }], vatEnabled:false, vatRate:20, notes:'', status:'draft' };
+}
+function ensureInvoiceShape(job){
+  if(!job.invoice || !Array.isArray(job.invoice.lineItems) || !job.invoice.lineItems.length){
+    job.invoice = defaultInvoice();
+  }
+  return job;
+}
 function newBlankJob(){
   return {
-    id: uid('job'), customerId:'', customerName:'', phone:'', address:'', applianceId:'',
-    date:'', time:'', jobType:'Service', status:'Scheduled', notes:'', ramsText:'',
-    completion:{ engineerName:'', regNumber:'', applianceLocation:'', flueType:'', ventilationOk:'', tightnessTest:'', spillageTest:'', flueFlowTest:'', coAlarmPresent:'', warningIssued:'', overallResult:'', remarks:'', nextInspection:'' }
+    id: uid('job'), customerId:'', customerName:'', phone:'', address:'', applianceIds:[],
+    date:'', time:'', durationMinutes:60, jobType:'Service', status:'Scheduled', notes:'', ramsText:'',
+    invoice: defaultInvoice(),
+    completions: { none: defaultCompletion() },
+    manualRefs: {},
+    recordType: 'commercial',
+    domesticCompletion: (function(){ const dc = defaultDomesticCompletion(); dc.applianceRows = { none: defaultDomesticApplianceRow() }; return dc; })()
   };
 }
 
@@ -512,6 +839,7 @@ async function renderCustomers(main){
         ${theirAppliances.map(a=>`<div class="appliance-row">
           <div><div class="t">${esc(a.applianceType)} — ${esc(a.make)} ${esc(a.model)}</div>
           <div class="m">Serial: ${esc(a.serial)||'—'} ${a.manual? '· <a href="'+esc(a.manual)+'" target="_blank">manual</a>':'· no manual link yet'}</div></div>
+          <button class="btn secondary small" data-editap="${a.id}" data-editcust="${c.id}">Edit</button>
         </div>`).join('') || '<div class="note">No appliances added yet.</div>'}
         <button class="btn secondary small" style="margin-top:12px;" data-addap="${c.id}">+ Add appliance</button>
         <div id="apformSlot_${c.id}"></div>
@@ -526,58 +854,70 @@ async function renderCustomers(main){
   }));
   listEl.querySelectorAll('[data-addap]').forEach(b=> b.addEventListener('click', ()=>{
     state.addingApplianceFor = b.dataset.addap;
-    badgeImageData = null;
+    badgeImageData = null; manualSearchResult = null; editingAppliance = null;
     document.getElementById('apformSlot_'+b.dataset.addap).innerHTML = applianceFormHTML();
     wireApplianceForm(b.dataset.addap, main);
   }));
+  listEl.querySelectorAll('[data-editap]').forEach(b=> b.addEventListener('click', ()=>{
+    const appliance = appliances.find(x=>x.id===b.dataset.editap);
+    if(!appliance) return;
+    state.addingApplianceFor = b.dataset.editcust;
+    badgeImageData = null; manualSearchResult = null; editingAppliance = appliance;
+    document.getElementById('apformSlot_'+b.dataset.editcust).innerHTML = applianceFormHTML(appliance);
+    wireApplianceForm(b.dataset.editcust, main, appliance);
+  }));
 }
 
-function applianceFormHTML(){
+function applianceFormHTML(appliance){
+  const a = appliance || {};
+  const isEdit = !!appliance;
   return `<div class="apform">
     <div class="field"><label>Appliance type</label>
-      <select id="ap_type"><option value="">— choose type —</option>${APPLIANCE_TYPES.map(t=>`<option>${t}</option>`).join('')}</select>
+      <select id="ap_type"><option value="">— choose type —</option>${APPLIANCE_TYPES.map(t=>`<option ${t===a.applianceType?'selected':''}>${t}</option>`).join('')}</select>
     </div>
-    <div id="ap_details" class="hidden">
+    <div id="ap_details" class="${isEdit?'':'hidden'}">
       <div class="grid2">
-        <div class="field"><label>Make</label><input id="ap_make"></div>
-        <div class="field"><label>Model</label><input id="ap_model"></div>
+        <div class="field"><label>Make</label><input id="ap_make" value="${esc(a.make)}"></div>
+        <div class="field"><label>Model</label><input id="ap_model" value="${esc(a.model)}"></div>
       </div>
       <div class="grid2">
-        <div class="field"><label>Serial number</label><input id="ap_serial"></div>
-        <div class="field"><label>Install location</label><input id="ap_location" placeholder="e.g. Airing cupboard"></div>
+        <div class="field"><label>Serial number</label><input id="ap_serial" value="${esc(a.serial)}"></div>
+        <div class="field"><label>Install location</label><input id="ap_location" placeholder="e.g. Airing cupboard" value="${esc(a.location)}"></div>
       </div>
-      <div class="field"><label>Notes / common faults</label><textarea id="ap_notes" rows="2"></textarea></div>
+      <div class="field"><label>Notes / common faults</label><textarea id="ap_notes" rows="2">${esc(a.notes)}</textarea></div>
 
       <div class="field">
         <label>Scan the data badge</label>
-        <input type="file" accept="image/*" capture="environment" id="badgePhotoInput">
-        <div id="badgePreview"></div>
+        <input type="file" accept="image/*" id="badgePhotoInput">
+        <div class="note">Take a new photo or choose one already on your device.</div>
+        <div id="badgePreview">${a.photoThumb ? `<img class="badge-thumb" src="${a.photoThumb}">` : ''}</div>
         <button class="btn secondary small" id="scanBadgeBtn" disabled style="margin-top:8px;">Scan photo</button>
         <div class="note" id="scanStatus">Takes a photo of the data badge and tries to read make, model and serial number automatically — always double-check the result.</div>
       </div>
 
       <div class="field">
         <label>Manufacturer instructions (PDF link)</label>
-        <input id="ap_manual" placeholder="Paste a link, or use Find manual below">
+        <input id="ap_manual" placeholder="Paste a link, or use Find manual below" value="${esc(a.manual)}">
         <button class="btn secondary small" id="findManualBtn" style="margin-top:8px;">Find manual online</button>
-        <div class="note" id="manualStatus">Searches the web for the official manual once make and model are filled in — check it's the right document before relying on it.</div>
+        <div class="note" id="manualStatus">Works from Make and Model alone — no photo needed. Fill those in above and searches the web for the official manual; always check it's the right document before relying on it.</div>
+        <div id="manualInfoBox"></div>
       </div>
 
       <div style="display:flex; gap:8px; margin-top:10px;">
-        <button class="btn safety small" id="saveApplianceBtn">Save appliance</button>
+        <button class="btn safety small" id="saveApplianceBtn">${isEdit?'Save changes':'Save appliance'}</button>
         <button class="btn secondary small" id="cancelApplianceBtn">Cancel</button>
       </div>
     </div>
   </div>`;
 }
 
-function wireApplianceForm(customerId, main){
+function wireApplianceForm(customerId, main, existingAppliance){
   const typeSel = document.getElementById('ap_type');
   const details = document.getElementById('ap_details');
   typeSel.addEventListener('change', ()=> details.classList.toggle('hidden', !typeSel.value));
 
   document.getElementById('cancelApplianceBtn').addEventListener('click', ()=>{
-    state.addingApplianceFor = null; badgeImageData = null; renderCustomers(main);
+    state.addingApplianceFor = null; badgeImageData = null; manualSearchResult = null; editingAppliance = null; renderCustomers(main);
   });
 
   const photoInput = document.getElementById('badgePhotoInput');
@@ -611,18 +951,33 @@ function wireApplianceForm(customerId, main){
   document.getElementById('findManualBtn').addEventListener('click', async ()=>{
     const make = document.getElementById('ap_make').value.trim();
     const model = document.getElementById('ap_model').value.trim();
+    const serial = document.getElementById('ap_serial').value.trim();
     if(!make || !model){ document.getElementById('manualStatus').textContent = 'Fill in make and model first.'; return; }
     const btn = document.getElementById('findManualBtn');
     btn.disabled = true;
     document.getElementById('manualStatus').textContent = 'Searching the web…';
+    document.getElementById('manualInfoBox').innerHTML = '';
     try{
-      const result = await findManualOnline(make, model);
+      const result = await findManualOnline(make, model, badgeImageData, serial);
+      manualSearchResult = result;
       if(result.url){
         document.getElementById('ap_manual').value = result.url;
-        document.getElementById('manualStatus').textContent = 'AI-suggested link — open it and confirm it\'s the right document before relying on it.';
+        document.getElementById('manualStatus').textContent = `Found: ${result.documentType || 'a document'} — open it and confirm it's the right one before relying on it.`;
       } else {
-        document.getElementById('manualStatus').textContent = result.note || "Couldn't find one automatically — add the link manually.";
+        document.getElementById('manualStatus').textContent = "No full manual confirmed — see details below, and check the contact info if you need to request one.";
       }
+      const contactLines = [];
+      if(result.manufacturerWebsite) contactLines.push(`<a href="${esc(result.manufacturerWebsite)}" target="_blank">${esc(result.manufacturerWebsite)}</a>`);
+      if(result.manufacturerPhone) contactLines.push(`<a href="tel:${esc(result.manufacturerPhone.replace(/\s+/g,''))}">${esc(result.manufacturerPhone)}</a>`);
+      if(result.manufacturerEmail) contactLines.push(`<a href="mailto:${esc(result.manufacturerEmail)}">${esc(result.manufacturerEmail)}</a>`);
+      document.getElementById('manualInfoBox').innerHTML = `
+        <div style="border:1px dashed var(--line); border-radius:8px; padding:10px; margin-top:8px;">
+          ${result.url ? `<button class="btn secondary small" id="openManualBtn" type="button" style="margin-bottom:8px;">Open manual</button>` : ''}
+          ${result.note ? `<div style="font-size:13px;">${esc(result.note)}</div>` : ''}
+          ${contactLines.length ? `<div class="note" style="margin-top:6px;"><strong>Manufacturer contact:</strong> ${contactLines.join(' · ')}</div>` : ''}
+        </div>`;
+      const openBtn = document.getElementById('openManualBtn');
+      if(openBtn) openBtn.addEventListener('click', ()=> window.open(result.url, '_blank'));
     }catch(err){
       console.error('manual search failed', err);
       document.getElementById('manualStatus').textContent = "Search failed — add the link manually.";
@@ -635,16 +990,28 @@ function wireApplianceForm(customerId, main){
     const make = document.getElementById('ap_make').value.trim();
     const model = document.getElementById('ap_model').value.trim();
     if(!applianceType || !make || !model){ alert('Appliance type, make and model are required.'); return; }
+    let manualNote = existingAppliance ? (existingAppliance.manualNote || '') : '';
+    if(manualSearchResult){
+      const parts = [];
+      if(manualSearchResult.note) parts.push(manualSearchResult.note);
+      const contact = [];
+      if(manualSearchResult.manufacturerWebsite) contact.push(manualSearchResult.manufacturerWebsite);
+      if(manualSearchResult.manufacturerPhone) contact.push(manualSearchResult.manufacturerPhone);
+      if(manualSearchResult.manufacturerEmail) contact.push(manualSearchResult.manufacturerEmail);
+      if(contact.length) parts.push('Manufacturer contact: ' + contact.join(' · '));
+      manualNote = parts.join('\n');
+    }
     const a = {
-      id: uid('ap'), customerId, applianceType, make, model,
+      id: existingAppliance ? existingAppliance.id : uid('ap'), customerId, applianceType, make, model,
       serial: document.getElementById('ap_serial').value.trim(),
       location: document.getElementById('ap_location').value.trim(),
       notes: document.getElementById('ap_notes').value.trim(),
       manual: document.getElementById('ap_manual').value.trim(),
-      photoThumb: badgeImageData ? badgeImageData.dataUrl : ''
+      manualNote,
+      photoThumb: badgeImageData ? badgeImageData.dataUrl : (existingAppliance ? existingAppliance.photoThumb||'' : '')
     };
     const saved = await saveAppliance(a);
-    if(saved){ state.addingApplianceFor = null; badgeImageData = null; renderCustomers(main); }
+    if(saved){ state.addingApplianceFor = null; badgeImageData = null; manualSearchResult = null; editingAppliance = null; renderCustomers(main); }
   });
 }
 
@@ -678,12 +1045,30 @@ async function renderNewJob(main){
         <div class="field"><label>Time</label><input type="time" id="j_time" value="${esc(prefillTime)}"></div>
         <div class="field"><label>Job type</label><select id="j_type">${JOB_TYPES.map(t=>`<option>${t}</option>`).join('')}</select></div>
       </div>
-      <div class="field"><label>Appliance</label>
-        <select id="j_appliance" ${!selectedId?'disabled':''}>
-          <option value="">— none linked yet —</option>
-          ${appliances.map(a=>`<option value="${a.id}">${esc(a.applianceType)} — ${esc(a.make)} ${esc(a.model)}</option>`).join('')}
+      <div class="field"><label>Completion form</label>
+        <select id="j_recordtype">
+          <option value="commercial" selected>Commercial (full non-domestic form)</option>
+          <option value="domestic">Domestic (Gas Safety Record / CP1 style)</option>
         </select>
-        ${selectedId && !appliances.length ? '<div class="note">This customer has no appliances on file yet — add one from the Customers tab.</div>' : ''}
+      </div>
+      <div class="field"><label>Estimated duration</label>
+        <select id="j_duration">
+          <option value="30">30 minutes</option>
+          <option value="60" selected>1 hour</option>
+          <option value="90">1.5 hours</option>
+          <option value="120">2 hours</option>
+          <option value="180">3 hours</option>
+          <option value="240">4 hours</option>
+          <option value="480">Full day</option>
+        </select>
+      </div>
+      <div class="field"><label>Appliance(s)</label>
+        ${!selectedId ? `<div class="note">Choose a customer first.</div>` : appliances.length ? `
+        <div class="apform">
+          ${appliances.map(a=>`<label style="display:flex; align-items:center; gap:8px; padding:4px 0; font-size:14px; font-weight:400; color:var(--ink);">
+            <input type="checkbox" class="j-appliance-cb" value="${a.id}" style="width:auto;"> ${esc(a.applianceType)} — ${esc(a.make)} ${esc(a.model)}
+          </label>`).join('')}
+        </div>` : '<div class="note">This customer has no appliances on file yet — add one from the Customers tab.</div>'}
       </div>
       <div class="field"><label>Notes</label><textarea id="j_notes" rows="2">${esc(prefillNotes)}</textarea></div>
       <button class="btn safety" id="createJobBtn">Create job folder</button>
@@ -700,11 +1085,15 @@ async function renderNewJob(main){
     job.customerId = customer.id; job.customerName = customer.name; job.phone = customer.phone; job.address = customer.address;
     job.date = document.getElementById('j_date').value;
     job.time = document.getElementById('j_time').value;
+    job.durationMinutes = parseInt(document.getElementById('j_duration').value) || 60;
     job.jobType = document.getElementById('j_type').value;
-    job.applianceId = document.getElementById('j_appliance').value;
+    job.recordType = document.getElementById('j_recordtype').value;
+    job.applianceIds = Array.from(main.querySelectorAll('.j-appliance-cb:checked')).map(cb=>cb.value);
     job.notes = document.getElementById('j_notes').value.trim();
-    const appliance = appliances.find(a=>a.id===job.applianceId);
-    job.ramsText = ramsTemplate(job, appliance);
+    const linkedAppliances = appliances.filter(a=>job.applianceIds.includes(a.id));
+    job.completions = {};
+    (job.applianceIds.length ? job.applianceIds : ['none']).forEach(k=> job.completions[k] = defaultCompletion());
+    job.ramsText = ramsTemplate(job, linkedAppliances);
     await saveJob(job);
     state.newJobCustomerId = '';
     setView('job', job.id);
@@ -719,8 +1108,17 @@ async function renderJobDetail(main){
       const bb = document.getElementById('backToJobs'); if(bb) bb.addEventListener('click', ()=> setView('jobs')); return; }
     job = JSON.parse(r.value); jobCache[job.id] = job;
   }
-  const appliances = await loadAll('appliance:');
-  const appliance = appliances.find(a=>a.id===job.applianceId);
+  ensureJobShape(job);
+  const allAppliances = await loadAll('appliance:');
+  const jobAppliances = allAppliances.filter(a=>job.applianceIds.includes(a.id));
+  const customers = await loadAll('customer:');
+  const customer = customers.find(cu=>cu.id===job.customerId);
+
+  const completionKeys = job.applianceIds.length ? job.applianceIds : ['none'];
+  if(!state.completionApplianceKey || !completionKeys.includes(state.completionApplianceKey)){
+    state.completionApplianceKey = completionKeys[0];
+  }
+  const currentAppliance = jobAppliances.find(a=>a.id===state.completionApplianceKey) || null; // reserved for future per-appliance UI needs
 
   main.innerHTML = `
     <button class="back" id="backBtn">← All jobs</button>
@@ -738,98 +1136,1401 @@ async function renderJobDetail(main){
   `;
   document.getElementById('backBtn').addEventListener('click', ()=> setView('jobs'));
   document.getElementById('statusSel').addEventListener('change', async (e)=>{ job.status = e.target.value; await saveJob(job); });
-  main.querySelectorAll('.tabs button').forEach(b=> b.addEventListener('click', ()=>{ state.jobTab=b.dataset.t; renderJobDetail(main); }));
+  main.querySelectorAll('.tabs button').forEach(b=> b.addEventListener('click', ()=>{ state.jobTab=b.dataset.t; state.editingJob=false; renderJobDetail(main); }));
 
   const body = document.getElementById('tabBody');
-  if(state.jobTab==='overview') body.innerHTML = overviewHTML(job, appliance);
+  if(state.jobTab==='overview') {
+    if(state.editingJob){
+      const customerAppliances = allAppliances.filter(a=>a.customerId===job.customerId);
+      body.innerHTML = editJobHTML(job, customerAppliances);
+      wireEditJob(job, main);
+    } else {
+      body.innerHTML = overviewHTML(job, jobAppliances);
+      wireOverview(job, main);
+    }
+  }
   if(state.jobTab==='rams') { body.innerHTML = ramsHTML(job); wireRams(job); }
-  if(state.jobTab==='completion') { body.innerHTML = completionHTML(job); wireCompletion(job); }
-  if(state.jobTab==='invoice') body.innerHTML = invoiceHTML(job, appliance);
+  if(state.jobTab==='completion') {
+    for(const key of completionKeys){
+      const appliance = jobAppliances.find(a=>a.id===key);
+      if(!appliance) continue;
+      if(job.recordType === 'domestic'){
+        const row = job.domesticCompletion.applianceRows[key];
+        if(row && !row.ventCalc.kw && !row.ventCalc.lowerFreeAreaCm2 && !row.ventCalc.higherFreeAreaCm2){
+          const prev = await findPreviousVentilationData(key, job.id);
+          if(prev) row.ventCalc = Object.assign({}, row.ventCalc, prev);
+        }
+      } else {
+        const c = job.completions[key];
+        if(c && !c.ventilation.calcKw && !c.ventilation.lowerFreeAreaCm2 && !c.ventilation.higherFreeAreaCm2){
+          const prev = await findPreviousVentilationData(key, job.id);
+          if(prev) c.ventilation = Object.assign({}, c.ventilation, { calcKw: prev.kw, calcUnit: prev.unit, calcFlueType: prev.flueType, lowerFreeAreaCm2: prev.lowerFreeAreaCm2, higherFreeAreaCm2: prev.higherFreeAreaCm2 });
+        }
+      }
+    }
+    if(job.recordType === 'domestic'){
+      body.innerHTML = domesticCompletionHTML(job, jobAppliances, completionKeys);
+      wireDomesticCompletion(job, jobAppliances, completionKeys);
+    } else {
+      let html = '';
+      if(completionKeys.length > 1){
+        html += `<div class="tabs" style="margin-bottom:14px;">${completionKeys.map(k=>{
+          const a = jobAppliances.find(x=>x.id===k);
+          const label = a ? `${esc(a.applianceType)} — ${esc(a.make)} ${esc(a.model)}` : 'General';
+          return `<button data-akey="${k}" class="${k===state.completionApplianceKey?'active':''}">${label}</button>`;
+        }).join('')}</div>`;
+      }
+      html += completionHTML(job, state.completionApplianceKey);
+      body.innerHTML = html;
+      body.querySelectorAll('[data-akey]').forEach(b=> b.addEventListener('click', ()=>{ state.completionApplianceKey = b.dataset.akey; renderJobDetail(main); }));
+      wireCompletion(job, jobAppliances, state.completionApplianceKey);
+    }
+  }
+  if(state.jobTab==='invoice') { body.innerHTML = invoiceHTML(job, jobAppliances, customer, completionKeys); wireInvoice(job, jobAppliances, customer); }
 }
 
-function overviewHTML(job, appliance){
+// ---- Business details (used to fill out printed safety records) ----
+function getBusinessDetails(){
+  try{
+    const v = localStorage.getItem(LS_PREFIX+'settings:business');
+    return v ? JSON.parse(v) : { name:'', address:'', phone:'', regNumber:'' };
+  }catch(e){ return { name:'', address:'', phone:'', regNumber:'' }; }
+}
+function saveBusinessDetails(b){ localStorage.setItem(LS_PREFIX+'settings:business', JSON.stringify(b)); }
+function getEngineers(){
+  try{
+    const v = localStorage.getItem(LS_PREFIX+'settings:engineers');
+    const list = v ? JSON.parse(v) : [];
+    return Array.isArray(list) ? list : [];
+  }catch(e){ return []; }
+}
+function saveEngineersList(list){ localStorage.setItem(LS_PREFIX+'settings:engineers', JSON.stringify(list)); }
+function showEngineersOverlay(onChange){
+  document.getElementById('backupOverlay').classList.remove('hidden');
+  document.getElementById('backupTitle').textContent = 'Engineers';
+  function renderBody(){
+    const list = getEngineers();
+    document.getElementById('backupBody').innerHTML = `
+      <p class="note">Save each engineer's name and reg number once — pick from the list on the completion form instead of retyping every job.</p>
+      <div id="engRows">
+      ${list.length ? list.map(e=>`
+        <div class="grid3" style="align-items:end; margin-bottom:8px;" data-eng="${e.id}">
+          <div class="field" style="margin-bottom:0;"><label>Name</label><input class="eng-name" value="${esc(e.name)}"></div>
+          <div class="field" style="margin-bottom:0;"><label>Reg no.</label><input class="eng-reg" value="${esc(e.regNumber)}"></div>
+          <button class="btn secondary small remove-eng-btn" data-id="${e.id}">✕</button>
+        </div>`).join('') : '<div class="note">No engineers saved yet.</div>'}
+      </div>
+      <button class="btn secondary small" id="addEngRowBtn" type="button">+ Add engineer</button>
+      <div class="divider"></div>
+      <button class="btn safety small" id="saveEngBtn">Save</button>
+    `;
+    document.getElementById('addEngRowBtn').addEventListener('click', ()=>{
+      const list2 = getEngineers();
+      list2.push({ id: uid('eng'), name:'', regNumber:'' });
+      saveEngineersList(list2);
+      renderBody();
+    });
+    document.querySelectorAll('.remove-eng-btn').forEach(b=> b.addEventListener('click', ()=>{
+      const list2 = getEngineers().filter(e=>e.id!==b.dataset.id);
+      saveEngineersList(list2);
+      renderBody();
+    }));
+    document.getElementById('saveEngBtn').addEventListener('click', ()=>{
+      const rows = document.querySelectorAll('[data-eng]');
+      const updated = Array.from(rows).map(row=>({
+        id: row.dataset.eng,
+        name: row.querySelector('.eng-name').value.trim(),
+        regNumber: row.querySelector('.eng-reg').value.trim()
+      }));
+      saveEngineersList(updated);
+      document.getElementById('backupOverlay').classList.add('hidden');
+      if(onChange) onChange(updated);
+    });
+  }
+  renderBody();
+}
+function showBusinessOverlay(onSaved){
+  const b = getBusinessDetails();
+  document.getElementById('backupOverlay').classList.remove('hidden');
+  document.getElementById('backupTitle').textContent = 'Business details';
+  document.getElementById('backupBody').innerHTML = `
+    <p class="note">Used to fill out the header of printed safety records.</p>
+    <div class="field"><label>Business name</label><input id="biz_name" value="${esc(b.name)}"></div>
+    <div class="field"><label>Business address</label><input id="biz_address" value="${esc(b.address)}"></div>
+    <div class="grid2">
+      <div class="field"><label>Phone</label><input id="biz_phone" value="${esc(b.phone)}"></div>
+      <div class="field"><label>Gas Safe / OFTEC reg no.</label><input id="biz_reg" value="${esc(b.regNumber)}"></div>
+    </div>
+    <button class="btn safety small" id="saveBizBtn">Save</button>
+  `;
+  document.getElementById('saveBizBtn').addEventListener('click', ()=>{
+    const nb = {
+      name: document.getElementById('biz_name').value.trim(),
+      address: document.getElementById('biz_address').value.trim(),
+      phone: document.getElementById('biz_phone').value.trim(),
+      regNumber: document.getElementById('biz_reg').value.trim()
+    };
+    saveBusinessDetails(nb);
+    document.getElementById('backupOverlay').classList.add('hidden');
+    if(onSaved) onSaved(nb);
+  });
+}
+
+async function addJobToCalendar(job){
+  if(!gcalToken){ alert('Connect Google Calendar from the Calendar tab first.'); return; }
+  if(!job.date){ alert('Add a date to this job first (Overview tab has no date field yet — set it when creating the job).'); return; }
+  await loadGapiClient();
+  gapi.client.setToken({ access_token: gcalToken });
+  const start = new Date(`${job.date}T${job.time || '09:00'}:00`);
+  const end = new Date(start.getTime() + (job.durationMinutes || 60)*60*1000);
+  try{
+    const resp = await gapi.client.calendar.events.insert({
+      calendarId: 'primary',
+      resource: {
+        summary: `${job.jobType} — ${job.customerName}`,
+        location: job.address,
+        description: job.notes || '',
+        start: { dateTime: start.toISOString() },
+        end: { dateTime: end.toISOString() }
+      }
+    });
+    job.calendarEventId = resp.result.id;
+    await saveJob(job);
+    renderJobDetail(document.getElementById('main'));
+  }catch(err){
+    console.error('add to calendar failed', err);
+    alert("Couldn't add this to your calendar — check you're connected and try again.");
+  }
+}
+function formatDuration(mins){
+  mins = mins || 60;
+  if(mins >= 480) return 'Full day';
+  if(mins % 60 === 0) return (mins/60) + ' hour' + (mins===60?'':'s');
+  if(mins < 60) return mins + ' minutes';
+  return (mins/60).toFixed(1).replace('.0','') + ' hours';
+}
+function overviewHTML(job, jobAppliances){
   return `<div class="card">
     <div class="grid2"><div><label>Customer</label><div>${esc(job.customerName)}</div></div><div><label>Phone</label><div>${esc(job.phone)||'—'}</div></div></div>
     <div class="divider"></div>
     <div class="grid2"><div><label>Date / time</label><div>${esc(job.date)||'—'} ${esc(job.time)||''}</div></div><div><label>Job type</label><div>${esc(job.jobType)}</div></div></div>
     <div class="divider"></div>
-    <label>Appliance</label>
-    <div>${appliance ? esc(appliance.applianceType)+' — '+esc(appliance.make)+' '+esc(appliance.model) : 'Not linked'}</div>
-    ${appliance && appliance.serial ? `<div class="note">Serial: ${esc(appliance.serial)}</div>` : ''}
-    ${appliance && appliance.manual ? `<div class="note"><a href="${esc(appliance.manual)}" target="_blank">Open manufacturer instructions (PDF)</a></div>` : ''}
-    ${appliance && appliance.notes ? `<div class="note">Common faults / notes: ${esc(appliance.notes)}</div>` : ''}
+    <div><label>Estimated duration</label><div>${formatDuration(job.durationMinutes)}</div></div>
+    <div class="divider"></div>
+    <label>Appliance(s)</label>
+    ${jobAppliances.length ? jobAppliances.map(appliance=>`
+    <div style="padding:8px 0; border-bottom:1px solid var(--line);">
+      <div>${esc(appliance.applianceType)} — ${esc(appliance.make)} ${esc(appliance.model)}</div>
+      ${appliance.serial ? `<div class="note">Serial: ${esc(appliance.serial)}</div>` : ''}
+      ${appliance.manual ? `<div class="note"><a href="${esc(appliance.manual)}" target="_blank">Open manufacturer instructions (PDF)</a></div>` : ''}
+      ${appliance.manualNote ? `<div class="note" style="white-space:pre-line;">${esc(appliance.manualNote)}</div>` : ''}
+      ${appliance.notes ? `<div class="note">Common faults / notes: ${esc(appliance.notes)}</div>` : ''}
+    </div>`).join('') : `<div>Not linked</div>`}
     <div class="divider"></div>
     <label>Job notes</label><div>${esc(job.notes)||'—'}</div>
+    <div class="divider"></div>
+    ${job.calendarEventId
+      ? `<div class="note">✓ On your Google Calendar</div>`
+      : `<button class="btn secondary small" id="addToCalBtn">Add to Google Calendar</button>`}
+    <button class="btn secondary small" id="editJobBtn" style="margin-left:8px;">Edit details</button>
   </div>`;
+}
+function editJobHTML(job, customerAppliances){
+  return `<div class="card">
+    <p class="note">Customer stays fixed once a job's created — for these fields, though, feel free to correct anything.</p>
+    <div class="grid3">
+      <div class="field"><label>Date</label><input type="date" id="ej_date" value="${esc(job.date)}"></div>
+      <div class="field"><label>Time</label><input type="time" id="ej_time" value="${esc(job.time)}"></div>
+      <div class="field"><label>Job type</label><select id="ej_type">${JOB_TYPES.map(t=>`<option ${t===job.jobType?'selected':''}>${t}</option>`).join('')}</select></div>
+    </div>
+    <div class="field"><label>Completion form</label>
+      <select id="ej_recordtype">
+        <option value="commercial" ${job.recordType!=='domestic'?'selected':''}>Commercial (full non-domestic form)</option>
+        <option value="domestic" ${job.recordType==='domestic'?'selected':''}>Domestic (Gas Safety Record / CP1 style)</option>
+      </select>
+    </div>
+    <div class="field"><label>Estimated duration</label>
+      <select id="ej_duration">
+        ${[[30,'30 minutes'],[60,'1 hour'],[90,'1.5 hours'],[120,'2 hours'],[180,'3 hours'],[240,'4 hours'],[480,'Full day']].map(([v,l])=>`<option value="${v}" ${v===job.durationMinutes?'selected':''}>${l}</option>`).join('')}
+      </select>
+    </div>
+    <div class="field"><label>Appliance(s)</label>
+      ${customerAppliances.length ? `<div class="apform">
+        ${customerAppliances.map(a=>`<label style="display:flex; align-items:center; gap:8px; padding:4px 0; font-size:14px; font-weight:400; color:var(--ink);">
+          <input type="checkbox" class="ej-appliance-cb" value="${a.id}" style="width:auto;" ${job.applianceIds.includes(a.id)?'checked':''}> ${esc(a.applianceType)} — ${esc(a.make)} ${esc(a.model)}
+        </label>`).join('')}
+      </div>` : '<div class="note">This customer has no appliances on file — add one from the Customers tab first.</div>'}
+    </div>
+    <div class="field"><label>Notes</label><textarea id="ej_notes" rows="3">${esc(job.notes)}</textarea></div>
+    <div style="display:flex; gap:8px;">
+      <button class="btn safety small" id="saveJobEditBtn">Save changes</button>
+      <button class="btn secondary small" id="cancelJobEditBtn">Cancel</button>
+    </div>
+  </div>`;
+}
+function wireOverview(job, main){
+  const btn = document.getElementById('addToCalBtn');
+  if(btn) btn.addEventListener('click', ()=> addJobToCalendar(job));
+  document.getElementById('editJobBtn').addEventListener('click', ()=>{ state.editingJob = true; renderJobDetail(main); });
+}
+function wireEditJob(job, main){
+  document.getElementById('cancelJobEditBtn').addEventListener('click', ()=>{ state.editingJob = false; renderJobDetail(main); });
+  document.getElementById('saveJobEditBtn').addEventListener('click', async ()=>{
+    job.date = document.getElementById('ej_date').value;
+    job.time = document.getElementById('ej_time').value;
+    job.jobType = document.getElementById('ej_type').value;
+    job.recordType = document.getElementById('ej_recordtype').value;
+    job.durationMinutes = parseInt(document.getElementById('ej_duration').value) || 60;
+    const newIds = Array.from(main.querySelectorAll('.ej-appliance-cb:checked')).map(cb=>cb.value);
+    job.applianceIds = newIds;
+    job.notes = document.getElementById('ej_notes').value.trim();
+    // keep completion data for appliances still linked, add blank ones for newly added appliances, fall back to "none" if all removed
+    const keys = newIds.length ? newIds : ['none'];
+    const newCompletions = {};
+    keys.forEach(k=> newCompletions[k] = job.completions[k] || defaultCompletion());
+    job.completions = newCompletions;
+    const newDomesticRows = {};
+    keys.forEach(k=> newDomesticRows[k] = job.domesticCompletion.applianceRows[k] || defaultDomesticApplianceRow());
+    job.domesticCompletion.applianceRows = newDomesticRows;
+    if(state.completionApplianceKey && !keys.includes(state.completionApplianceKey)) state.completionApplianceKey = null;
+    await saveJob(job);
+    state.editingJob = false;
+    renderJobDetail(main);
+  });
 }
 function ramsHTML(job){
   return `<div class="card">
     <textarea id="ramsBox" rows="20" style="font-family:monospace; font-size:13px;">${esc(job.ramsText)}</textarea>
-    <div style="margin-top:10px; display:flex; gap:8px;">
+    <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap;">
       <button class="btn safety small" id="saveRamsBtn">Save</button>
       <button class="btn secondary small" id="regenRamsBtn">Regenerate from template</button>
+      <button class="btn secondary small" id="lookupManualRefsBtn">Look up manual page references</button>
     </div>
+    <div id="manualRefsStatus" class="note" style="margin-top:8px;"></div>
   </div>`;
 }
 function wireRams(job){
   document.getElementById('saveRamsBtn').addEventListener('click', async ()=>{ job.ramsText = document.getElementById('ramsBox').value; await saveJob(job); });
   document.getElementById('regenRamsBtn').addEventListener('click', async ()=>{
-    const appliances = await loadAll('appliance:');
-    const appliance = appliances.find(a=>a.id===job.applianceId);
-    job.ramsText = ramsTemplate(job, appliance); await saveJob(job); renderJobDetail(document.getElementById('main'));
+    const allAppliances = await loadAll('appliance:');
+    const jobAppliances = allAppliances.filter(a=>job.applianceIds.includes(a.id));
+    job.ramsText = ramsTemplate(job, jobAppliances, job.manualRefs); await saveJob(job); renderJobDetail(document.getElementById('main'));
   });
-}
-function completionHTML(job){
-  const c = job.completion;
-  const yn = (id,val) => `<select id="${id}"><option value="">—</option><option ${val==='Pass'?'selected':''}>Pass</option><option ${val==='Fail'?'selected':''}>Fail</option><option ${val==='N/A'?'selected':''}>N/A</option></select>`;
-  return `<div class="card">
-    <p class="note">This captures everything a Gas Safe / OFTEC record needs. Once you're registered, copy these into the official certificate — this isn't a substitute for it.</p>
-    <div class="grid2"><div class="field"><label>Engineer name</label><input id="c_eng" value="${esc(c.engineerName)}"></div><div class="field"><label>Gas Safe / OFTEC reg no.</label><input id="c_reg" value="${esc(c.regNumber)}"></div></div>
-    <div class="grid2"><div class="field"><label>Appliance location</label><input id="c_loc" value="${esc(c.applianceLocation)}"></div><div class="field"><label>Flue type</label><input id="c_flue" value="${esc(c.flueType)}"></div></div>
-    <div class="grid3"><div class="field"><label>Ventilation</label>${yn('c_vent', c.ventilationOk)}</div><div class="field"><label>Tightness test</label>${yn('c_tight', c.tightnessTest)}</div><div class="field"><label>Spillage test</label>${yn('c_spill', c.spillageTest)}</div></div>
-    <div class="grid3"><div class="field"><label>Flue flow test</label>${yn('c_flow', c.flueFlowTest)}</div><div class="field"><label>CO alarm present</label>${yn('c_co', c.coAlarmPresent)}</div><div class="field"><label>Warning notice issued</label>${yn('c_warn', c.warningIssued)}</div></div>
-    <div class="field"><label>Overall result</label><select id="c_result"><option value="">—</option><option ${c.overallResult==='Safe to use'?'selected':''}>Safe to use</option><option ${c.overallResult==='At Risk'?'selected':''}>At Risk</option><option ${c.overallResult==='Immediately Dangerous'?'selected':''}>Immediately Dangerous</option></select></div>
-    <div class="field"><label>Remarks</label><textarea id="c_remarks" rows="2">${esc(c.remarks)}</textarea></div>
-    <div class="field"><label>Next inspection due</label><input type="date" id="c_next" value="${esc(c.nextInspection)}"></div>
-    <button class="btn safety small" id="saveCompletionBtn">Save completion form</button>
-  </div>`;
-}
-function wireCompletion(job){
-  document.getElementById('saveCompletionBtn').addEventListener('click', async ()=>{
-    job.completion = {
-      engineerName: document.getElementById('c_eng').value, regNumber: document.getElementById('c_reg').value,
-      applianceLocation: document.getElementById('c_loc').value, flueType: document.getElementById('c_flue').value,
-      ventilationOk: document.getElementById('c_vent').value, tightnessTest: document.getElementById('c_tight').value,
-      spillageTest: document.getElementById('c_spill').value, flueFlowTest: document.getElementById('c_flow').value,
-      coAlarmPresent: document.getElementById('c_co').value, warningIssued: document.getElementById('c_warn').value,
-      overallResult: document.getElementById('c_result').value, remarks: document.getElementById('c_remarks').value,
-      nextInspection: document.getElementById('c_next').value
-    };
-    if(job.status==='Scheduled') job.status='In Progress';
+  document.getElementById('lookupManualRefsBtn').addEventListener('click', async ()=>{
+    const allAppliances = await loadAll('appliance:');
+    const jobAppliances = allAppliances.filter(a=>job.applianceIds.includes(a.id));
+    const withManuals = jobAppliances.filter(a=>a.manual);
+    const statusEl = document.getElementById('manualRefsStatus');
+    if(!withManuals.length){ statusEl.textContent = 'None of the linked appliances have a manual link saved yet — add one from the Customers tab first.'; return; }
+    statusEl.textContent = `Looking up ${withManuals.length} manual${withManuals.length>1?'s':''}...`;
+    for(const a of withManuals){
+      try{
+        const ref = await findManualSection(a.make, a.model, a.manual, job.jobType);
+        job.manualRefs[a.id] = ref;
+      }catch(e){
+        job.manualRefs[a.id] = { chapter:'', page:'', note:'Lookup failed — try again or check the manual manually.' };
+      }
+    }
+    job.ramsText = ramsTemplate(job, jobAppliances, job.manualRefs);
     await saveJob(job);
     renderJobDetail(document.getElementById('main'));
   });
 }
-function invoiceHTML(job, appliance){
-  const c = job.completion;
-  const ready = c.overallResult;
-  const resultClass = c.overallResult==='Safe to use' ? 'result-safe' : c.overallResult==='At Risk' ? 'result-atrisk' : c.overallResult==='Immediately Dangerous' ? 'result-id' : '';
-  return `<div class="card">
-    ${!ready ? `<div class="empty">Complete the job completion form first — the invoice draft pulls from it.</div>` : `
-    <label>Result</label><span class="result-pill ${resultClass}">${esc(c.overallResult)}</span>
-    <div class="divider"></div>
-    <div class="grid2"><div><label>Bill to</label><div>${esc(job.customerName)}<br>${esc(job.address)}</div></div>
-    <div><label>Job</label><div>${esc(job.jobType)}${appliance? ' — '+esc(appliance.make)+' '+esc(appliance.model):''}</div></div></div>
-    <div class="divider"></div>
-    <label>Line items</label><div class="note">Callout / labour — £ ____<br>Parts — £ ____<br>VAT (if applicable) — £ ____</div>
-    <div class="divider"></div>
-    <p class="note"><strong>This is a draft only.</strong> Pricing needs to be filled in and the draft reviewed by you before it's sent to the customer — nothing here goes out automatically.</p>
-    <button class="btn secondary small" disabled>Send for review (coming with invoicing phase)</button>
-    `}
+function completionHTML(job, applianceKey){
+  const c = job.completions[applianceKey];
+  const passFail = (id,val) => `<select id="${id}"><option value="">—</option><option ${val==='Pass'?'selected':''}>Pass</option><option ${val==='Fail'?'selected':''}>Fail</option><option ${val==='N/A'?'selected':''}>N/A</option></select>`;
+  const yesNo = (id,val) => `<select id="${id}"><option value="">—</option><option ${val==='Yes'?'selected':''}>Yes</option><option ${val==='No'?'selected':''}>No</option><option ${val==='N/A'?'selected':''}>N/A</option></select>`;
+  const num = (id,val,ph) => `<input id="${id}" value="${esc(val)}" placeholder="${ph||''}">`;
+  return `
+  <div class="card">
+    <p class="note">This mirrors a standard non-domestic gas safety record. Fill in what applies to this job — once you're registered, the printed record at the bottom can go straight in the customer's file.</p>
+    <div class="field"><label>Engineer on this job</label>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <select id="c_eng_select" style="flex:1;">
+          <option value="">— choose saved engineer / enter manually below —</option>
+          ${getEngineers().map(e=>`<option value="${e.id}" ${e.name===c.engineerName && e.regNumber===c.regNumber ? 'selected':''}>${esc(e.name)}${e.regNumber?' — '+esc(e.regNumber):''}</option>`).join('')}
+        </select>
+        <button class="btn secondary small" id="manageEngineersBtn" type="button" style="white-space:nowrap;">Manage</button>
+      </div>
+    </div>
+    <div class="grid2"><div class="field"><label>Engineer name</label><input id="c_eng" value="${esc(c.engineerName)}"></div><div class="field"><label>Gas Safe / OFTEC reg no.</label><input id="c_reg" value="${esc(c.regNumber)}"></div></div>
+  </div>
+
+  <div class="card"><h3 style="font-size:15px; margin-bottom:4px;">Combustion checks</h3>
+    <p class="note" style="margin-bottom:10px;">Taken at low fire and high fire where the appliance supports it — leave High blank for single-rate appliances.</p>
+    <div class="apform" style="margin-bottom:14px;">
+      <label>Import from analyser printout</label>
+      <input type="file" accept="image/*" id="analyserPhotoInput">
+      <div id="analyserPreview"></div>
+      <div class="grid2" style="margin-top:8px;">
+        <div class="field"><label>Apply readings to</label>
+          <select id="analyserTarget"><option value="low">Low fire</option><option value="high">High fire</option></select>
+        </div>
+        <div class="field" style="display:flex; align-items:flex-end;">
+          <button class="btn secondary small" id="scanAnalyserBtn" disabled>Scan printout</button>
+        </div>
+      </div>
+      <div class="note" id="analyserStatus">Take a photo of the analyser's printed or on-screen readout and it'll fill in the matching fields below — always worth a quick check against the original.</div>
+    </div>
+    <div class="apform" style="margin-bottom:14px;">
+      <label>Import from analyser JSON export</label>
+      <input type="file" accept=".json,application/json" id="analyserJsonInput">
+      <div class="note" id="analyserJsonStatus">Exports usually contain every reading the device has logged — pick the one(s) for this job from the list below once loaded.</div>
+      <div id="analyserJsonList" style="max-height:260px; overflow:auto; margin-top:8px;"></div>
+    </div>
+    ${COMBUSTION_FIELDS.map(([key,label])=>`
+    <div class="comb-row">
+      <label>${label}</label>
+      <div class="comb-inputs">
+        <input id="cbl_${key}" placeholder="Low" value="${esc(c.combustion.low[key])}">
+        <input id="cbh_${key}" placeholder="High" value="${esc(c.combustion.high[key])}">
+      </div>
+    </div>`).join('')}
+  </div>
+
+  <div class="card"><h3 style="font-size:15px; margin-bottom:10px;">General safety checks</h3>
+    <div class="grid2">
+      <div class="field"><label>Compressor / booster working correctly</label>${yesNo('gc_compressor', c.generalChecks.compressorOk)}</div>
+      <div class="field"><label>Chimney installed to current standards</label>${yesNo('gc_chimney', c.generalChecks.chimneyStandard)}</div>
+    </div>
+    <div class="grid3">
+      <div class="field"><label>Gas tightness test undertaken</label>${passFail('gc_tight', c.generalChecks.tightnessTest)}</div>
+      <div class="field"><label>Pipework sufficiently supported</label>${yesNo('gc_pipesup', c.generalChecks.pipeworkSupported)}</div>
+      <div class="field"><label>Chimney termination satisfactory</label>${yesNo('gc_termination', c.generalChecks.chimneyTermination)}</div>
+    </div>
+    <div class="field"><label>Fan-flue interlock opening correctly</label>${yesNo('gc_interlock', c.generalChecks.fanFlueInterlock)}</div>
+  </div>
+
+  <div class="card"><h3 style="font-size:15px; margin-bottom:10px;">Ventilation</h3>
+    <div id="ventCalcBox" style="border:1px dashed var(--line); padding:10px; border-radius:8px; margin-bottom:14px;">
+      <div style="font-weight:600; font-size:13px; margin-bottom:8px;">Recommended ventilation (BS 5440-2) — compare against what's actually there</div>
+      <div class="grid3">
+        <div class="field" style="margin-bottom:6px;"><label>Max heat input (kW)</label><input id="vc_kw" inputmode="decimal" placeholder="e.g. 24" value="${esc(c.ventilation.calcKw)}"></div>
+        <div class="field" style="margin-bottom:6px;"><label>Figure is</label>
+          <select id="vc_unit">
+            <option value="net" ${c.ventilation.calcUnit!=='gross'?'selected':''}>Net</option>
+            <option value="gross" ${c.ventilation.calcUnit==='gross'?'selected':''}>Gross (÷1.1)</option>
+          </select>
+        </div>
+        <div class="field" style="margin-bottom:6px;"><label>Flue type</label>
+          <select id="vc_flue">
+            <option value="" ${!c.ventilation.calcFlueType?'selected':''}>— select —</option>
+            <option value="room-sealed" ${c.ventilation.calcFlueType==='room-sealed'?'selected':''}>Room-sealed / balanced flue</option>
+            <option value="open-direct" ${c.ventilation.calcFlueType==='open-direct'?'selected':''}>Open flue — natural draught, with draught diverter — direct to outside air</option>
+            <option value="open-fanned" ${c.ventilation.calcFlueType==='open-fanned'?'selected':''}>Open flue — fan assisted, no draught diverter ("conventional flue") — direct to outside air</option>
+            <option value="open-compartment" ${c.ventilation.calcFlueType==='open-compartment'?'selected':''}>Open flue — via cupboard/compartment</option>
+            <option value="flueless" ${c.ventilation.calcFlueType==='flueless'?'selected':''}>Flueless</option>
+          </select>
+        </div>
+      </div>
+      <div id="ventCalcResult" class="note" style="margin-top:4px;"></div>
+    </div>
+    <div class="grid2">
+      <div class="field"><label>Lower level free area (cm²) — actually installed</label>${num('v_lower', c.ventilation.lowerFreeAreaCm2)}</div>
+      <div class="field"><label>Higher level free area (cm²) — actually installed</label>${num('v_higher', c.ventilation.higherFreeAreaCm2)}</div>
+    </div>
+    <div class="grid3">
+      <div class="field"><label>Natural ventilation satisfactory</label>${yesNo('v_natsat', c.ventilation.naturalSatisfactory)}</div>
+      <div class="field"><label>Mechanical flow rate inlet (m³/s)</label>${num('v_mechin', c.ventilation.mechFlowInlet)}</div>
+      <div class="field"><label>Mechanical flow rate extract (m³/s)</label>${num('v_mechout', c.ventilation.mechFlowExtract)}</div>
+    </div>
+    <div class="field"><label>Mechanical ventilation satisfactory</label>${yesNo('v_mechsat', c.ventilation.mechSatisfactory)}</div>
+  </div>
+
+  <div class="card"><h3 style="font-size:15px; margin-bottom:10px;">Extra checks</h3>
+    <div class="grid3">
+      <div class="field"><label>Adequate ventilation</label>${yesNo('e_vent', c.extraChecks.adequateVentilation)}</div>
+      <div class="field"><label>Satisfactory spillage test</label>${passFail('e_spill', c.extraChecks.spillageTest)}</div>
+      <div class="field"><label>Flue flow test satisfactory</label>${passFail('e_flow', c.extraChecks.flueFlowTest)}</div>
+    </div>
+    <div class="grid3">
+      <div class="field"><label>Air/gas pressure switch working</label>${yesNo('e_pswitch', c.extraChecks.pressureSwitch)}</div>
+      <div class="field"><label>Burner lock-out time</label>${num('e_lockout', c.extraChecks.lockOutTime)}</div>
+      <div class="field"><label>Temperature thermostats working</label>${yesNo('e_tempstat', c.extraChecks.tempThermostats)}</div>
+    </div>
+    <div class="grid2">
+      <div class="field"><label>Limit thermostats working</label>${yesNo('e_limitstat', c.extraChecks.limitThermostats)}</div>
+      <div class="field"><label>Appliance serviced</label>${yesNo('e_serviced', c.extraChecks.serviced)}</div>
+    </div>
+  </div>
+
+  <div class="card"><h3 style="font-size:15px; margin-bottom:10px;">Installation pipework</h3>
+    <div class="grid3">
+      <div class="field"><label>Line diagram present at meter</label>${yesNo('p_diagram', c.pipework.lineDiagramPresent)}</div>
+      <div class="field"><label>Line diagram current</label>${yesNo('p_diagramcurrent', c.pipework.lineDiagramCurrent)}</div>
+      <div class="field"><label>Emergency isolation valves fitted</label>${yesNo('p_isolation', c.pipework.isolationValvesFitted)}</div>
+    </div>
+    <div class="grid3">
+      <div class="field"><label>Valve handles in place & labelled</label>${yesNo('p_handles', c.pipework.valveHandlesLabelled)}</div>
+      <div class="field"><label>Pipework sealed & sleeved</label>${yesNo('p_sealed', c.pipework.pipeworkSealed)}</div>
+      <div class="field"><label>Pipework colour coded / identified</label>${yesNo('p_colour', c.pipework.pipeworkColourCoded)}</div>
+    </div>
+    <div class="field"><label>Installation electrically bonded</label>${yesNo('p_bonded', c.pipework.electricallyBonded)}</div>
+  </div>
+
+  <div class="card"><h3 style="font-size:15px; margin-bottom:10px;">Meter installation</h3>
+    <div class="grid3">
+      <div class="field"><label>Accessible</label>${yesNo('m_access', c.meter.accessible)}</div>
+      <div class="field"><label>Compartment free from clutter</label>${yesNo('m_clutter', c.meter.clutterFree)}</div>
+      <div class="field"><label>Compartment sufficiently ventilated</label>${yesNo('m_vent', c.meter.ventilated)}</div>
+    </div>
+    <div class="grid2">
+      <div class="field"><label>Compartment secure</label>${yesNo('m_secure', c.meter.secure)}</div>
+      <div class="field"><label>Lock key clearly labelled</label>${yesNo('m_key', c.meter.keyLabelled)}</div>
+    </div>
+  </div>
+
+  <div class="card"><h3 style="font-size:15px; margin-bottom:10px;">Safety information</h3>
+    <div class="grid2">
+      <div class="field"><label>CO alarm present</label>${yesNo('s_coalarm', c.safetyInfo.coAlarmPresent)}</div>
+      <div class="field"><label>Warning / advice notice issued</label>${yesNo('s_warnnotice', c.safetyInfo.warningNoticeIssued)}</div>
+    </div>
+    <div class="grid2">
+      <div class="field"><label>Warning labels attached</label>${yesNo('s_warnlabel', c.safetyInfo.warningLabelsAttached)}</div>
+      <div class="field"><label>Responsible person advised</label>${yesNo('s_advised', c.safetyInfo.responsiblePersonAdvised)}</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="field"><label>Details of work carried out</label><textarea id="c_work" rows="2">${esc(c.workCarriedOut)}</textarea></div>
+    <div class="field"><label>Remedial work needed</label><textarea id="c_remedial" rows="2">${esc(c.remedialWork)}</textarea></div>
+    <div class="field"><label>Overall result</label><select id="c_result"><option value="">—</option><option ${c.overallResult==='Safe to use'?'selected':''}>Safe to use</option><option ${c.overallResult==='At Risk'?'selected':''}>At Risk</option><option ${c.overallResult==='Immediately Dangerous'?'selected':''}>Immediately Dangerous</option></select></div>
+    <div class="field"><label>Remarks</label><textarea id="c_remarks" rows="2">${esc(c.remarks)}</textarea></div>
+    <div class="field"><label>Next inspection due</label><input type="date" id="c_next" value="${esc(c.nextInspection)}"></div>
+    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+      <button class="btn safety small" id="saveCompletionBtn">Save completion form</button>
+      <button class="btn secondary small" id="printRecordBtn">Preview safety record</button>
+      <button class="btn secondary small" id="editBizBtn">Business details</button>
+    </div>
   </div>`;
+}
+function readCombustionSide(prefix){
+  const out = {};
+  COMBUSTION_FIELDS.forEach(([key])=> out[key] = document.getElementById(prefix+key).value);
+  return out;
+}
+function readCompletionFromForm(){
+  return {
+    engineerName: document.getElementById('c_eng').value, regNumber: document.getElementById('c_reg').value,
+    combustion: { low: readCombustionSide('cbl_'), high: readCombustionSide('cbh_') },
+    generalChecks:{
+      compressorOk: document.getElementById('gc_compressor').value,
+      chimneyStandard: document.getElementById('gc_chimney').value, tightnessTest: document.getElementById('gc_tight').value,
+      pipeworkSupported: document.getElementById('gc_pipesup').value, chimneyTermination: document.getElementById('gc_termination').value,
+      fanFlueInterlock: document.getElementById('gc_interlock').value
+    },
+    ventilation:{
+      lowerFreeAreaCm2: document.getElementById('v_lower').value, higherFreeAreaCm2: document.getElementById('v_higher').value,
+      naturalSatisfactory: document.getElementById('v_natsat').value, mechFlowInlet: document.getElementById('v_mechin').value,
+      mechFlowExtract: document.getElementById('v_mechout').value, mechSatisfactory: document.getElementById('v_mechsat').value,
+      calcKw: document.getElementById('vc_kw').value, calcUnit: document.getElementById('vc_unit').value, calcFlueType: document.getElementById('vc_flue').value
+    },
+    extraChecks:{
+      adequateVentilation: document.getElementById('e_vent').value, spillageTest: document.getElementById('e_spill').value,
+      flueFlowTest: document.getElementById('e_flow').value, pressureSwitch: document.getElementById('e_pswitch').value,
+      lockOutTime: document.getElementById('e_lockout').value, tempThermostats: document.getElementById('e_tempstat').value,
+      limitThermostats: document.getElementById('e_limitstat').value, serviced: document.getElementById('e_serviced').value
+    },
+    pipework:{
+      lineDiagramPresent: document.getElementById('p_diagram').value, lineDiagramCurrent: document.getElementById('p_diagramcurrent').value,
+      isolationValvesFitted: document.getElementById('p_isolation').value, valveHandlesLabelled: document.getElementById('p_handles').value,
+      pipeworkSealed: document.getElementById('p_sealed').value, pipeworkColourCoded: document.getElementById('p_colour').value,
+      electricallyBonded: document.getElementById('p_bonded').value
+    },
+    meter:{
+      accessible: document.getElementById('m_access').value, clutterFree: document.getElementById('m_clutter').value,
+      ventilated: document.getElementById('m_vent').value, secure: document.getElementById('m_secure').value,
+      keyLabelled: document.getElementById('m_key').value
+    },
+    safetyInfo:{
+      coAlarmPresent: document.getElementById('s_coalarm').value, warningNoticeIssued: document.getElementById('s_warnnotice').value,
+      warningLabelsAttached: document.getElementById('s_warnlabel').value, responsiblePersonAdvised: document.getElementById('s_advised').value
+    },
+    workCarriedOut: document.getElementById('c_work').value, remedialWork: document.getElementById('c_remedial').value,
+    overallResult: document.getElementById('c_result').value, remarks: document.getElementById('c_remarks').value,
+    nextInspection: document.getElementById('c_next').value
+  };
+}
+async function findPreviousVentilationData(applianceId, excludeJobId){
+  if(!applianceId) return null;
+  const allJobs = await loadAll('job:');
+  const candidates = allJobs.filter(j=> j && j.id !== excludeJobId && Array.isArray(j.applianceIds) && j.applianceIds.includes(applianceId));
+  candidates.sort((a,b)=> (b.date||'').localeCompare(a.date||''));
+  for(const j of candidates){
+    if(j.completions && j.completions[applianceId] && j.completions[applianceId].ventilation){
+      const v = j.completions[applianceId].ventilation;
+      if(v.calcKw || v.lowerFreeAreaCm2 || v.higherFreeAreaCm2){
+        return { kw: v.calcKw||'', unit: v.calcUnit||'net', flueType: v.calcFlueType||'', lowerFreeAreaCm2: v.lowerFreeAreaCm2||'', higherFreeAreaCm2: v.higherFreeAreaCm2||'' };
+      }
+    }
+    if(j.domesticCompletion && j.domesticCompletion.applianceRows && j.domesticCompletion.applianceRows[applianceId]){
+      const vc = j.domesticCompletion.applianceRows[applianceId].ventCalc;
+      if(vc && (vc.kw || vc.lowerFreeAreaCm2 || vc.higherFreeAreaCm2)){
+        return { kw: vc.kw||'', unit: vc.unit||'net', flueType: vc.flueType||'', lowerFreeAreaCm2: vc.lowerFreeAreaCm2||'', higherFreeAreaCm2: vc.higherFreeAreaCm2||'' };
+      }
+    }
+  }
+  return null;
+}
+function calcVentilation(kw, unit, flueType){
+  const netKw = unit === 'gross' ? kw / 1.1 : kw;
+  if(flueType === 'room-sealed'){
+    return { area: 0, determinable:true, note: `Room-sealed (balanced flue) appliances draw combustion air from outside via the flue and don't normally need additional room ventilation. If this one's in a cupboard or compartment, check the manufacturer's instructions for any cooling-air requirement — that's a separate figure.` };
+  }
+  if(flueType === 'open-direct' || flueType === 'open-fanned'){
+    const fannedNote = flueType === 'open-fanned' ? ` Fan-assisted open flues without a draught diverter still draw their combustion air from the room, so they use the same room ventilation formula as natural-draught open flues — the fan changes the flue design, not this figure.` : '';
+    if(netKw <= 7){
+      return { area: 0, determinable:true, note: `${netKw.toFixed(2)}kW net is at or below the 7kW threshold — BS 5440-2 treats background (adventitious) ventilation as sufficient, so no additional permanent vent is normally required.${fannedNote} Always confirm against the manufacturer's instructions.` };
+    }
+    const area = (netKw - 7) * 5;
+    return { area, determinable:true, note: `BS 5440-2, ventilating direct to outside air: (${netKw.toFixed(2)}kW net − 7kW) × 5cm²/kW = ${area.toFixed(1)}cm².${fannedNote} This is a single combined opening — whether it sits at low or high level depends on the appliance and installation, so check the manufacturer's instructions before deciding which field to put it in below.` };
+  }
+  if(flueType === 'open-compartment'){
+    return { area: null, determinable:false, note: `Ventilating an open-flued appliance through a cupboard or compartment uses a different low/high-level split in BS 5440-2, and depends on the ventilation route — this calculator doesn't cover that case reliably. Work it out from BS 5440-2 directly or the manufacturer's instructions.` };
+  }
+  return { area: null, determinable:false, note: `Flueless appliances are sized against room volume (W/m³), not a flat cm²/kW figure — see BS 5440-2 Table 6 or the manufacturer's instructions.` };
+}
+function updateVentCalc(){
+  const kwEl = document.getElementById('vc_kw');
+  const unitEl = document.getElementById('vc_unit');
+  const flueEl = document.getElementById('vc_flue');
+  const resultEl = document.getElementById('ventCalcResult');
+  if(!kwEl || !resultEl) return;
+  const kw = parseFloat(kwEl.value);
+  const unit = unitEl.value;
+  const flueType = flueEl.value;
+  if(!flueType){ resultEl.innerHTML = `Fill in heat input and flue type for a recommended figure to compare against.`; return; }
+  if(isNaN(kw) || kw <= 0){ resultEl.innerHTML = `Enter the max heat input in kW.`; return; }
+  const r = calcVentilation(kw, unit, flueType);
+  const lower = parseFloat(document.getElementById('v_lower').value) || 0;
+  const higher = parseFloat(document.getElementById('v_higher').value) || 0;
+  const installed = lower + higher;
+  let compareLine = '';
+  if(r.determinable && r.area !== null){
+    if(installed === 0){
+      compareLine = `<div style="margin-top:6px;">Nothing entered yet in the Lower/Higher fields below to compare against.</div>`;
+    } else if(installed + 0.05 >= r.area){
+      compareLine = `<div style="margin-top:6px; color:#2E7D32; font-weight:600;">✓ ${installed.toFixed(1)}cm² entered meets or exceeds the ${r.area.toFixed(1)}cm² recommended.</div>`;
+    } else {
+      compareLine = `<div style="margin-top:6px; color:var(--safety); font-weight:600;">⚠ ${installed.toFixed(1)}cm² entered is ${(r.area-installed).toFixed(1)}cm² short of the ${r.area.toFixed(1)}cm² recommended.</div>`;
+    }
+  }
+  resultEl.innerHTML = `
+    ${r.determinable && r.area !== null ? `<div style="font-size:18px; font-weight:700; color:var(--ink);">Recommended: ${r.area.toFixed(1)} cm²</div>` : ''}
+    <div style="margin-top:4px;">${esc(r.note)}</div>
+    ${compareLine}
+  `;
+}
+function wireCompletion(job, jobAppliances, applianceKey){
+  document.getElementById('saveCompletionBtn').addEventListener('click', async ()=>{
+    job.completions[applianceKey] = readCompletionFromForm();
+    if(job.status==='Scheduled') job.status='In Progress';
+    await saveJob(job);
+    renderJobDetail(document.getElementById('main'));
+  });
+  document.getElementById('editBizBtn').addEventListener('click', ()=> showBusinessOverlay());
+  const engSelect = document.getElementById('c_eng_select');
+  if(engSelect) engSelect.addEventListener('change', ()=>{
+    const chosen = getEngineers().find(e=>e.id===engSelect.value);
+    if(chosen){
+      document.getElementById('c_eng').value = chosen.name;
+      document.getElementById('c_reg').value = chosen.regNumber;
+    }
+  });
+  const manageBtn = document.getElementById('manageEngineersBtn');
+  if(manageBtn) manageBtn.addEventListener('click', ()=> showEngineersOverlay(()=>{
+    job.completions[applianceKey] = readCompletionFromForm();
+    renderJobDetail(document.getElementById('main'));
+  }));
+  ['vc_kw','vc_unit','vc_flue','v_lower','v_higher'].forEach(id=>{
+    const el = document.getElementById(id);
+    if(el){ el.addEventListener('input', updateVentCalc); el.addEventListener('change', updateVentCalc); }
+  });
+  updateVentCalc();
+  document.getElementById('printRecordBtn').addEventListener('click', async ()=>{
+    job.completions[applianceKey] = readCompletionFromForm();
+    if(job.status==='Scheduled') job.status='In Progress';
+    await saveJob(job);
+    openPrintableRecord(job, jobAppliances);
+  });
+
+  ['cbl_','cbh_'].forEach(prefix=>{
+    const grossEl = document.getElementById(prefix+'flueGasTempC');
+    const roomEl = document.getElementById(prefix+'roomTempC');
+    const netEl = document.getElementById(prefix+'flueGasTempNetC');
+    function recalcNet(){
+      const gross = parseFloat(grossEl.value), room = parseFloat(roomEl.value);
+      if(!isNaN(gross) && !isNaN(room)) netEl.value = (gross - room).toFixed(1);
+    }
+    grossEl.addEventListener('input', recalcNet);
+    roomEl.addEventListener('input', recalcNet);
+  });
+
+  let analyserImageData = null;
+  const analyserInput = document.getElementById('analyserPhotoInput');
+  const scanAnalyserBtn = document.getElementById('scanAnalyserBtn');
+  analyserInput.addEventListener('change', async ()=>{
+    const file = analyserInput.files[0]; if(!file) return;
+    try{
+      const compressed = await compressImage(file, 1100, 0.75);
+      analyserImageData = compressed;
+      document.getElementById('analyserPreview').innerHTML = `<img class="badge-thumb" src="${compressed.dataUrl}">`;
+      scanAnalyserBtn.disabled = false;
+    }catch(err){ document.getElementById('analyserStatus').textContent = 'Could not read that photo — try a different one.'; }
+  });
+  scanAnalyserBtn.addEventListener('click', async ()=>{
+    if(!analyserImageData) return;
+    scanAnalyserBtn.disabled = true;
+    document.getElementById('analyserStatus').textContent = 'Reading the printout…';
+    try{
+      const result = await scanAnalyserPrintout(analyserImageData.base64, analyserImageData.mediaType);
+      const prefix = document.getElementById('analyserTarget').value === 'high' ? 'cbh_' : 'cbl_';
+      let filled = 0;
+      COMBUSTION_FIELDS.forEach(([key])=>{
+        if(key==='burnerPressureMbar') return; // gas pressure is a separate manual reading, never auto-filled
+        if(result[key]){ document.getElementById(prefix+key).value = result[key]; filled++; }
+      });
+      document.getElementById('analyserStatus').textContent = filled
+        ? `Filled in ${filled} field${filled===1?'':'s'} — check them against the printout, then Save.`
+        : "Couldn't make out any readings from that photo — try a clearer shot or enter them manually.";
+    }catch(err){
+      console.error('analyser scan failed', err);
+      document.getElementById('analyserStatus').textContent = "Couldn't read that printout automatically — enter the readings manually.";
+    }
+    scanAnalyserBtn.disabled = false;
+  });
+
+  let analyserReadings = [];
+  function applyReadingToForm(entry, target){
+    const mapped = mapAnalyserReading(entry);
+    const prefix = target==='high' ? 'cbh_' : 'cbl_';
+    let filled = 0;
+    COMBUSTION_FIELDS.forEach(([key])=>{ if(key==='burnerPressureMbar') return; if(mapped[key]){ document.getElementById(prefix+key).value = mapped[key]; filled++; } });
+    document.getElementById('analyserJsonStatus').textContent =
+      `Filled in ${filled} field${filled===1?'':'s'} from ${entry.report_details.date} ${entry.report_details.time} into ${target==='high'?'High':'Low'} fire — check them, then Save.`;
+  }
+  function renderAnalyserJsonList(){
+    const listEl = document.getElementById('analyserJsonList');
+    if(!analyserReadings.length){ listEl.innerHTML = ''; return; }
+    const withIdx = analyserReadings.map((e,i)=>({e,i}));
+    withIdx.sort((a,b)=> ((b.e.report_details.date||'')+(b.e.report_details.time||'')).localeCompare((a.e.report_details.date||'')+(a.e.report_details.time||'')));
+    listEl.innerHTML = withIdx.slice(0,30).map(({e,i})=>`
+      <div class="joblist-item" style="cursor:default;">
+        <div class="jl-left"><div class="cust">${esc(e.report_details.date)} ${esc(e.report_details.time)}</div></div>
+        <div style="display:flex; gap:6px;">
+          <button class="btn secondary small use-low-btn" data-idx="${i}">→ Low</button>
+          <button class="btn secondary small use-high-btn" data-idx="${i}">→ High</button>
+        </div>
+      </div>`).join('');
+    listEl.querySelectorAll('.use-low-btn').forEach(b=> b.addEventListener('click', ()=> applyReadingToForm(analyserReadings[parseInt(b.dataset.idx)], 'low')));
+    listEl.querySelectorAll('.use-high-btn').forEach(b=> b.addEventListener('click', ()=> applyReadingToForm(analyserReadings[parseInt(b.dataset.idx)], 'high')));
+  }
+  document.getElementById('analyserJsonInput').addEventListener('change', (e)=>{
+    const file = e.target.files[0]; if(!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try{
+        analyserReadings = parseAnalyserJson(reader.result);
+        if(!analyserReadings.length){ document.getElementById('analyserJsonStatus').textContent = "That file loaded but didn't contain any combustion readings."; return; }
+        document.getElementById('analyserJsonStatus').textContent = `Loaded ${analyserReadings.length} reading${analyserReadings.length===1?'':'s'} — pick the one(s) for this job below (most recent first).`;
+        renderAnalyserJsonList();
+      }catch(err){
+        console.error('analyser json parse failed', err);
+        document.getElementById('analyserJsonStatus').textContent = "That file didn't look like a valid analyser export.";
+      }
+    };
+    reader.readAsText(file);
+  });
+}
+function domesticCompletionHTML(job, jobAppliances, completionKeys){
+  const dc = job.domesticCompletion;
+  return `
+  <div class="card">
+    <h3 style="font-size:15px; margin-bottom:10px;">Job / client details</h3>
+    <p class="note">Job address and phone come from the customer record. Fill in client details below only if they're different — e.g. a tenant on site vs. a landlord as the billing contact.</p>
+    <div class="field"><label>Rented accommodation?</label><select id="dc_rented"><option value="">—</option><option ${dc.rentedAccommodation==='Yes'?'selected':''}>Yes</option><option ${dc.rentedAccommodation==='No'?'selected':''}>No</option></select></div>
+    <div class="grid2">
+      <div class="field"><label>Client name (if different)</label><input id="dc_clientname" value="${esc(dc.clientName)}"></div>
+      <div class="field"><label>Client tel (if different)</label><input id="dc_clienttel" value="${esc(dc.clientTel)}"></div>
+    </div>
+    <div class="grid2">
+      <div class="field"><label>Client address (if different)</label><input id="dc_clientaddress" value="${esc(dc.clientAddress)}"></div>
+      <div class="field"><label>Client postcode</label><input id="dc_clientpostcode" value="${esc(dc.clientPostcode)}"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3 style="font-size:15px; margin-bottom:10px;">Engineer</h3>
+    <div style="display:flex; gap:8px; align-items:center;">
+      <select id="dc_eng_select" style="flex:1;">
+        <option value="">— choose saved engineer / enter manually below —</option>
+        ${getEngineers().map(e=>`<option value="${e.id}" ${e.name===dc.issuedBy.printName && e.regNumber===dc.issuedBy.licenceNo ? 'selected':''}>${esc(e.name)}${e.regNumber?' — '+esc(e.regNumber):''}</option>`).join('')}
+      </select>
+      <button class="btn secondary small" id="dc_manageEngineersBtn" type="button" style="white-space:nowrap;">Manage</button>
+    </div>
+    <div class="grid2" style="margin-top:10px;">
+      <div class="field"><label>Print name</label><input id="dc_issuedname" value="${esc(dc.issuedBy.printName)}"></div>
+      <div class="field"><label>Licence no.</label><input id="dc_issuedlicence" value="${esc(dc.issuedBy.licenceNo)}"></div>
+    </div>
+    <button class="btn secondary small" id="dc_editBizBtn" type="button">Edit registered business details</button>
+  </div>
+
+  ${completionKeys.map(key=>{
+    const appliance = jobAppliances.find(a=>a.id===key) || null;
+    const r = dc.applianceRows[key];
+    const label = appliance ? `${esc(appliance.applianceType)} — ${esc(appliance.make)} ${esc(appliance.model)}` : 'General (no appliance linked)';
+    const ynSel = (id,val) => `<select id="${id}"><option value="">—</option><option ${val==='Yes'?'selected':''}>Yes</option><option ${val==='No'?'selected':''}>No</option></select>`;
+    const ynNaSel = (id,val) => `<select id="${id}"><option value="">—</option><option ${val==='Yes'?'selected':''}>Yes</option><option ${val==='No'?'selected':''}>No</option><option ${val==='N/A'?'selected':''}>N/A</option></select>`;
+    const passFailNaSel = (id,val) => `<select id="${id}"><option value="">—</option><option ${val==='Pass'?'selected':''}>Pass</option><option ${val==='Fail'?'selected':''}>Fail</option><option ${val==='N/A'?'selected':''}>N/A</option></select>`;
+    return `
+    <div class="card" data-domrow="${key}">
+      <h3 style="font-size:15px; margin-bottom:4px;">${label}</h3>
+      ${appliance && appliance.location ? `<div class="note" style="margin-bottom:10px;">Location: ${esc(appliance.location)}</div>` : ''}
+      <div class="grid3">
+        <div class="field"><label>Chimney/flue type</label>
+          <select id="dr_flue_${key}">
+            <option value="">—</option>
+            <option value="FL" ${r.chimneyFlueType==='FL'?'selected':''}>FL — Flueless</option>
+            <option value="OF" ${r.chimneyFlueType==='OF'?'selected':''}>OF — Open flue</option>
+            <option value="RS" ${r.chimneyFlueType==='RS'?'selected':''}>RS — Room-sealed</option>
+          </select>
+        </div>
+        <div class="field"><label>Landlord's appliance?</label>${ynNaSel('dr_landlord_'+key, r.landlordAppliance)}</div>
+        <div class="field"><label>Appliance checked?</label>${ynSel('dr_checked_'+key, r.applianceChecked)}</div>
+      </div>
+
+      <div style="border:1px dashed var(--line); border-radius:8px; padding:10px; margin:10px 0;">
+        <div style="font-weight:600; font-size:13px; margin-bottom:8px;">Recommended ventilation (BS 5440-2) — compare against what's actually there</div>
+        <div class="grid3">
+          <div class="field" style="margin-bottom:6px;"><label>Max heat input (kW)</label><input id="dvc_kw_${key}" inputmode="decimal" placeholder="e.g. 24" value="${esc(r.ventCalc.kw)}"></div>
+          <div class="field" style="margin-bottom:6px;"><label>Figure is</label>
+            <select id="dvc_unit_${key}">
+              <option value="net" ${r.ventCalc.unit!=='gross'?'selected':''}>Net</option>
+              <option value="gross" ${r.ventCalc.unit==='gross'?'selected':''}>Gross (÷1.1)</option>
+            </select>
+          </div>
+          <div class="field" style="margin-bottom:6px;"><label>Flue type (for calc)</label>
+            <select id="dvc_flue_${key}">
+              <option value="" ${!r.ventCalc.flueType?'selected':''}>— select —</option>
+              <option value="room-sealed" ${r.ventCalc.flueType==='room-sealed'?'selected':''}>Room-sealed / balanced flue</option>
+              <option value="open-direct" ${r.ventCalc.flueType==='open-direct'?'selected':''}>Open flue — natural draught</option>
+              <option value="open-fanned" ${r.ventCalc.flueType==='open-fanned'?'selected':''}>Open flue — fan assisted ("conventional")</option>
+              <option value="open-compartment" ${r.ventCalc.flueType==='open-compartment'?'selected':''}>Open flue — via cupboard/compartment</option>
+              <option value="flueless" ${r.ventCalc.flueType==='flueless'?'selected':''}>Flueless</option>
+            </select>
+          </div>
+        </div>
+        <div class="grid2">
+          <div class="field" style="margin-bottom:6px;"><label>Free area (cm²) — actually installed, lower</label><input id="dv_lower_${key}" value="${esc(r.ventCalc.lowerFreeAreaCm2)}"></div>
+          <div class="field" style="margin-bottom:6px;"><label>Free area (cm²) — actually installed, higher</label><input id="dv_higher_${key}" value="${esc(r.ventCalc.higherFreeAreaCm2)}"></div>
+        </div>
+        <div id="dventCalcResult_${key}" class="note"></div>
+      </div>
+      <div class="field"><label>Ventilation satisfactory (for the record)</label>${ynSel('dr_vent_'+key, r.ventilationSatisfactory)}</div>
+
+      <div class="grid2">
+        <div class="field"><label>Operating pressure or heat input (mbar/kW)</label><input id="dr_pressure_${key}" value="${esc(r.operatingPressureOrHeatInput)}"></div>
+        <div class="field"><label>Safety device(s) correct operation</label>${ynSel('dr_safety_'+key, r.safetyDeviceOk)}</div>
+      </div>
+      <div class="grid2">
+        <div class="field"><label>Visual condition satisfactory (chimney)</label>${ynNaSel('dr_chimvisual_'+key, r.visualConditionSatisfactory)}</div>
+        <div class="field"><label>Chimney/flue performance</label>${passFailNaSel('dr_chimperf_'+key, r.chimneyFluePerformance)}</div>
+      </div>
+      <div class="grid2">
+        <div class="field"><label>Combustion reading — initial</label><input id="dr_combinit_${key}" value="${esc(r.combustionInitial)}"></div>
+        <div class="field"><label>Combustion reading — final</label><input id="dr_combfinal_${key}" value="${esc(r.combustionFinal)}"></div>
+      </div>
+      <div class="grid3">
+        <div class="field"><label>Serviced</label>${ynSel('dr_serviced_'+key, r.serviced)}</div>
+        <div class="field"><label>Visual inspection only</label>${ynSel('dr_visualonly_'+key, r.visualInspectionOnly)}</div>
+        <div class="field"><label>Safe to use</label>
+          <select id="dr_safeuse_${key}"><option value="">—</option><option ${r.safeToUse==='Yes'?'selected':''}>Yes</option><option ${r.safeToUse==='No'?'selected':''}>No</option><option ${r.safeToUse==='NT'?'selected':''}>NT (Not Tested)</option></select>
+        </div>
+      </div>
+      <div class="grid3">
+        <div class="field"><label>CO alarm correctly installed</label>${ynNaSel('dr_coinst_'+key, r.coCorrectlyInstalled)}</div>
+        <div class="field"><label>CO alarm in date</label>${ynNaSel('dr_codate_'+key, r.coInDate)}</div>
+        <div class="field"><label>CO alarm test satisfactory</label>${ynNaSel('dr_cotest_'+key, r.coTestSatisfactory)}</div>
+      </div>
+      <div class="field"><label>Appliance defect(s) identified</label><textarea id="dr_defect_${key}" rows="2">${esc(r.defect)}</textarea></div>
+      <div class="field"><label>Remedial action taken</label><textarea id="dr_remedial_${key}" rows="2">${esc(r.remedialAction)}</textarea></div>
+    </div>`;
+  }).join('')}
+
+  <div class="card">
+    <h3 style="font-size:15px; margin-bottom:10px;">Installation general</h3>
+    <div class="grid2">
+      <div class="field"><label>Emergency control valve satisfactory</label><select id="dc_ecv"><option value="">—</option><option ${dc.installationGeneral.ecvSatisfactory==='Yes'?'selected':''}>Yes</option><option ${dc.installationGeneral.ecvSatisfactory==='No'?'selected':''}>No</option><option ${dc.installationGeneral.ecvSatisfactory==='N/A'?'selected':''}>N/A</option></select></div>
+      <div class="field"><label>Gas installation pipework satisfactory (visual)</label><select id="dc_pipework"><option value="">—</option><option ${dc.installationGeneral.pipeworkSatisfactory==='Yes'?'selected':''}>Yes</option><option ${dc.installationGeneral.pipeworkSatisfactory==='No'?'selected':''}>No</option><option ${dc.installationGeneral.pipeworkSatisfactory==='N/A'?'selected':''}>N/A</option></select></div>
+    </div>
+    <div class="grid2">
+      <div class="field"><label>Meter/cylinder installation satisfactory (visual)</label><select id="dc_meter"><option value="">—</option><option ${dc.installationGeneral.meterCylinderSatisfactory==='Yes'?'selected':''}>Yes</option><option ${dc.installationGeneral.meterCylinderSatisfactory==='No'?'selected':''}>No</option><option ${dc.installationGeneral.meterCylinderSatisfactory==='N/A'?'selected':''}>N/A</option></select></div>
+      <div class="field"><label>Gas installation correct materials used (visual)</label><select id="dc_materials"><option value="">—</option><option ${dc.installationGeneral.correctMaterialsUsed==='Yes'?'selected':''}>Yes</option><option ${dc.installationGeneral.correctMaterialsUsed==='No'?'selected':''}>No</option><option ${dc.installationGeneral.correctMaterialsUsed==='N/A'?'selected':''}>N/A</option></select></div>
+    </div>
+    <div class="grid2">
+      <div class="field"><label>Main protective bonding satisfactory (visual)</label><select id="dc_bonding"><option value="">—</option><option ${dc.installationGeneral.mainBondingSatisfactory==='Yes'?'selected':''}>Yes</option><option ${dc.installationGeneral.mainBondingSatisfactory==='No'?'selected':''}>No</option><option ${dc.installationGeneral.mainBondingSatisfactory==='N/A'?'selected':''}>N/A</option></select></div>
+      <div class="field"><label>Gas tightness test satisfactory</label><select id="dc_tightness"><option value="">—</option><option ${dc.installationGeneral.tightnessTestSatisfactory==='Yes'?'selected':''}>Yes</option><option ${dc.installationGeneral.tightnessTestSatisfactory==='No'?'selected':''}>No</option><option ${dc.installationGeneral.tightnessTestSatisfactory==='N/A'?'selected':''}>N/A</option></select></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="field"><label>Details of other work carried out</label><textarea id="dc_otherwork" rows="3">${esc(dc.otherWorkCarriedOut)}</textarea></div>
+    <div class="field"><label>Observations / comments / remedial work required</label><textarea id="dc_observations" rows="3">${esc(dc.observations)}</textarea></div>
+    <div class="grid2">
+      <div class="field"><label>Warning notice serial no.</label><input id="dc_warningserial" value="${esc(dc.warningNoticeSerial)}"></div>
+      <div class="field"><label>Next safety check due before</label><input type="date" id="dc_nextcheck" value="${esc(dc.nextSafetyCheckDue)}"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3 style="font-size:15px; margin-bottom:10px;">Received by</h3>
+    <div class="grid2">
+      <div class="field"><label>Print name</label><input id="dc_receivedname" value="${esc(dc.receivedBy.printName)}"></div>
+      <div class="field"><label>Home owner / tenant / landlord / other</label><input id="dc_receivedrole" value="${esc(dc.receivedBy.role)}"></div>
+    </div>
+    <div class="field"><label><input type="checkbox" id="dc_nooneattended" style="width:auto; margin-right:6px;" ${dc.receivedBy.noOnePresent?'checked':''}>No one present at the time of visit</label></div>
+  </div>
+
+  <div class="card">
+    <button class="btn safety small" id="saveDomesticBtn">Save</button>
+    <button class="btn secondary small" id="printDomesticBtn">Preview / print domestic record</button>
+  </div>
+  `;
+}
+function readDomesticCompletionFromForm(completionKeys){
+  const applianceRows = {};
+  completionKeys.forEach(key=>{
+    applianceRows[key] = {
+      chimneyFlueType: document.getElementById('dr_flue_'+key).value,
+      landlordAppliance: document.getElementById('dr_landlord_'+key).value,
+      applianceChecked: document.getElementById('dr_checked_'+key).value,
+      ventilationSatisfactory: document.getElementById('dr_vent_'+key).value,
+      operatingPressureOrHeatInput: document.getElementById('dr_pressure_'+key).value,
+      safetyDeviceOk: document.getElementById('dr_safety_'+key).value,
+      visualConditionSatisfactory: document.getElementById('dr_chimvisual_'+key).value,
+      chimneyFluePerformance: document.getElementById('dr_chimperf_'+key).value,
+      combustionInitial: document.getElementById('dr_combinit_'+key).value,
+      combustionFinal: document.getElementById('dr_combfinal_'+key).value,
+      serviced: document.getElementById('dr_serviced_'+key).value,
+      visualInspectionOnly: document.getElementById('dr_visualonly_'+key).value,
+      safeToUse: (document.getElementById('dr_safeuse_'+key).value || '').split(' ')[0],
+      coCorrectlyInstalled: document.getElementById('dr_coinst_'+key).value,
+      coInDate: document.getElementById('dr_codate_'+key).value,
+      coTestSatisfactory: document.getElementById('dr_cotest_'+key).value,
+      defect: document.getElementById('dr_defect_'+key).value.trim(),
+      remedialAction: document.getElementById('dr_remedial_'+key).value.trim(),
+      ventCalc: {
+        kw: document.getElementById('dvc_kw_'+key).value,
+        unit: document.getElementById('dvc_unit_'+key).value,
+        flueType: document.getElementById('dvc_flue_'+key).value,
+        lowerFreeAreaCm2: document.getElementById('dv_lower_'+key).value,
+        higherFreeAreaCm2: document.getElementById('dv_higher_'+key).value
+      }
+    };
+  });
+  return {
+    rentedAccommodation: document.getElementById('dc_rented').value,
+    clientName: document.getElementById('dc_clientname').value.trim(),
+    clientAddress: document.getElementById('dc_clientaddress').value.trim(),
+    clientPostcode: document.getElementById('dc_clientpostcode').value.trim(),
+    clientTel: document.getElementById('dc_clienttel').value.trim(),
+    applianceRows,
+    installationGeneral:{
+      ecvSatisfactory: document.getElementById('dc_ecv').value,
+      pipeworkSatisfactory: document.getElementById('dc_pipework').value,
+      meterCylinderSatisfactory: document.getElementById('dc_meter').value,
+      correctMaterialsUsed: document.getElementById('dc_materials').value,
+      mainBondingSatisfactory: document.getElementById('dc_bonding').value,
+      tightnessTestSatisfactory: document.getElementById('dc_tightness').value
+    },
+    otherWorkCarriedOut: document.getElementById('dc_otherwork').value.trim(),
+    observations: document.getElementById('dc_observations').value.trim(),
+    warningNoticeSerial: document.getElementById('dc_warningserial').value.trim(),
+    nextSafetyCheckDue: document.getElementById('dc_nextcheck').value,
+    issuedBy:{
+      printName: document.getElementById('dc_issuedname').value.trim(),
+      licenceNo: document.getElementById('dc_issuedlicence').value.trim(),
+      signed:'', issueDate:''
+    },
+    receivedBy:{
+      printName: document.getElementById('dc_receivedname').value.trim(),
+      role: document.getElementById('dc_receivedrole').value.trim(),
+      signed:'',
+      noOnePresent: document.getElementById('dc_nooneattended').checked
+    }
+  };
+}
+function updateVentCalcRow(key){
+  const kwEl = document.getElementById('dvc_kw_'+key);
+  const unitEl = document.getElementById('dvc_unit_'+key);
+  const flueEl = document.getElementById('dvc_flue_'+key);
+  const resultEl = document.getElementById('dventCalcResult_'+key);
+  if(!kwEl || !resultEl) return;
+  const kw = parseFloat(kwEl.value);
+  const unit = unitEl.value;
+  const flueType = flueEl.value;
+  if(!flueType){ resultEl.innerHTML = `Fill in heat input and flue type for a recommended figure to compare against.`; return; }
+  if(isNaN(kw) || kw <= 0){ resultEl.innerHTML = `Enter the max heat input in kW.`; return; }
+  const r = calcVentilation(kw, unit, flueType);
+  const lower = parseFloat(document.getElementById('dv_lower_'+key).value) || 0;
+  const higher = parseFloat(document.getElementById('dv_higher_'+key).value) || 0;
+  const installed = lower + higher;
+  let compareLine = '';
+  if(r.determinable && r.area !== null){
+    if(installed === 0){
+      compareLine = `<div style="margin-top:6px;">Nothing entered yet in the free area fields above to compare against.</div>`;
+    } else if(installed + 0.05 >= r.area){
+      compareLine = `<div style="margin-top:6px; color:#2E7D32; font-weight:600;">✓ ${installed.toFixed(1)}cm² entered meets or exceeds the ${r.area.toFixed(1)}cm² recommended.</div>`;
+    } else {
+      compareLine = `<div style="margin-top:6px; color:var(--safety); font-weight:600;">⚠ ${installed.toFixed(1)}cm² entered is ${(r.area-installed).toFixed(1)}cm² short of the ${r.area.toFixed(1)}cm² recommended.</div>`;
+    }
+  }
+  resultEl.innerHTML = `
+    ${r.determinable && r.area !== null ? `<div style="font-size:16px; font-weight:700; color:var(--ink);">Recommended: ${r.area.toFixed(1)} cm²</div>` : ''}
+    <div style="margin-top:4px;">${esc(r.note)}</div>
+    ${compareLine}
+  `;
+}
+function wireDomesticCompletion(job, jobAppliances, completionKeys){
+  const main = document.getElementById('main');
+  const doSave = async ()=>{
+    job.domesticCompletion = readDomesticCompletionFromForm(completionKeys);
+    if(job.status==='Scheduled') job.status='In Progress';
+    await saveJob(job);
+  };
+  document.getElementById('saveDomesticBtn').addEventListener('click', async ()=>{ await doSave(); renderJobDetail(main); });
+  document.getElementById('printDomesticBtn').addEventListener('click', async ()=>{ await doSave(); openPrintableDomesticRecord(job, jobAppliances); });
+  document.getElementById('dc_editBizBtn').addEventListener('click', ()=> showBusinessOverlay());
+  const engSelect = document.getElementById('dc_eng_select');
+  if(engSelect) engSelect.addEventListener('change', ()=>{
+    const chosen = getEngineers().find(e=>e.id===engSelect.value);
+    if(chosen){
+      document.getElementById('dc_issuedname').value = chosen.name;
+      document.getElementById('dc_issuedlicence').value = chosen.regNumber;
+    }
+  });
+  const manageBtn = document.getElementById('dc_manageEngineersBtn');
+  if(manageBtn) manageBtn.addEventListener('click', ()=> showEngineersOverlay(async ()=>{
+    await doSave();
+    renderJobDetail(main);
+  }));
+  completionKeys.forEach(key=>{
+    ['dvc_kw_'+key,'dvc_unit_'+key,'dvc_flue_'+key,'dv_lower_'+key,'dv_higher_'+key].forEach(id=>{
+      const el = document.getElementById(id);
+      if(el){ el.addEventListener('input', ()=>updateVentCalcRow(key)); el.addEventListener('change', ()=>updateVentCalcRow(key)); }
+    });
+    updateVentCalcRow(key);
+  });
+}
+function buildDomesticRecordHTML(job, jobAppliances, biz){
+  const dc = job.domesticCompletion;
+  const completionKeys = job.applianceIds.length ? job.applianceIds : ['none'];
+  const rows = completionKeys.map(k=>({ key:k, appliance: jobAppliances.find(a=>a.id===k)||null, r: dc.applianceRows[k] }));
+  const yn = v => esc(v)||'—';
+  return `
+    <h1>Gas Safety Record — Domestic</h1>
+    <p class="pr-note">Prepared by ${esc(biz.name)||'(business name not set)'} using Callout. This is a working record for the engineer's own files — refer to the current Gas Safety (Installation and Use) Regulations for statutory requirements.</p>
+    <table class="pr-table">
+      <tr><th colspan="2">Job address</th><th colspan="2">Client details (if different)</th></tr>
+      <tr><td>Name</td><td>${esc(job.customerName)}</td><td>Name</td><td>${esc(dc.clientName)||'—'}</td></tr>
+      <tr><td>Address</td><td>${esc(job.address)}</td><td>Address</td><td>${esc(dc.clientAddress)||'—'}</td></tr>
+      <tr><td>Tel</td><td>${esc(job.phone)}</td><td>Tel</td><td>${esc(dc.clientTel)||'—'}</td></tr>
+      <tr><td>Rented accommodation?</td><td colspan="3">${yn(dc.rentedAccommodation)}</td></tr>
+    </table>
+    <table class="pr-table">
+      <tr><th colspan="2">Registered business details</th></tr>
+      <tr><td>Reg No.</td><td>${esc(biz.regNumber)}</td></tr>
+      <tr><td>Company</td><td>${esc(biz.name)}</td></tr>
+      <tr><td>Address</td><td>${esc(biz.address)}</td></tr>
+      <tr><td>Tel</td><td>${esc(biz.phone)}</td></tr>
+    </table>
+
+    <table class="pr-grid">
+      <tr><th colspan="7">Appliance details</th></tr>
+      <tr><th>Location</th><th>Appliance type</th><th>Make</th><th>Model</th><th>Chimney/flue type</th><th>Landlord's appliance</th><th>Appliance checked</th></tr>
+      ${rows.map(({appliance,r})=>`<tr>
+        <td>${appliance?esc(appliance.location):'—'}</td>
+        <td>${appliance?esc(appliance.applianceType):'—'}</td>
+        <td>${appliance?esc(appliance.make):'—'}</td>
+        <td>${appliance?esc(appliance.model):'—'}</td>
+        <td>${esc(r.chimneyFlueType)||'—'}</td>
+        <td>${yn(r.landlordAppliance)}</td>
+        <td>${yn(r.applianceChecked)}</td>
+      </tr>`).join('')}
+    </table>
+
+    <table class="pr-grid">
+      <tr><th colspan="3">Inspection / safety checks</th></tr>
+      <tr><th>Ventilation satisfactory</th><th>Operating pressure or heat input (mbar/kW)</th><th>Safety device(s) correct operation</th></tr>
+      ${rows.map(({r})=>`<tr><td>${yn(r.ventilationSatisfactory)}</td><td>${esc(r.operatingPressureOrHeatInput)||'—'}</td><td>${yn(r.safetyDeviceOk)}</td></tr>`).join('')}
+    </table>
+
+    <table class="pr-grid">
+      <tr><th colspan="2">Chimney checks</th></tr>
+      <tr><th>Visual condition satisfactory</th><th>Chimney/flue performance</th></tr>
+      ${rows.map(({r})=>`<tr><td>${yn(r.visualConditionSatisfactory)}</td><td>${yn(r.chimneyFluePerformance)}</td></tr>`).join('')}
+    </table>
+
+    <table class="pr-grid">
+      <tr><th colspan="2">Combustion reading(s)</th></tr>
+      <tr><th>Initial</th><th>Final</th></tr>
+      ${rows.map(({r})=>`<tr><td>${esc(r.combustionInitial)||'—'}</td><td>${esc(r.combustionFinal)||'—'}</td></tr>`).join('')}
+    </table>
+
+    <table class="pr-grid">
+      <tr><th colspan="3">Appliance summary</th></tr>
+      <tr><th>Serviced</th><th>Visual inspection only</th><th>Safe to use</th></tr>
+      ${rows.map(({r})=>`<tr><td>${yn(r.serviced)}</td><td>${yn(r.visualInspectionOnly)}</td><td><strong>${yn(r.safeToUse)}</strong></td></tr>`).join('')}
+    </table>
+
+    <table class="pr-grid">
+      <tr><th colspan="3">Audible CO detector</th></tr>
+      <tr><th>Correctly installed</th><th>In date</th><th>Test satisfactory</th></tr>
+      ${rows.map(({r})=>`<tr><td>${yn(r.coCorrectlyInstalled)}</td><td>${yn(r.coInDate)}</td><td>${yn(r.coTestSatisfactory)}</td></tr>`).join('')}
+    </table>
+
+    ${rows.some(({r})=>r.defect || r.remedialAction) ? `
+    <table class="pr-grid">
+      <tr><th colspan="2">Appliance defect(s) identified / remedial action taken</th></tr>
+      <tr><th>Defect</th><th>Remedial action</th></tr>
+      ${rows.map(({r})=>`<tr><td>${esc(r.defect)||'—'}</td><td>${esc(r.remedialAction)||'—'}</td></tr>`).join('')}
+    </table>` : ''}
+
+    <table class="pr-table">
+      <tr><th colspan="2">Installation general</th></tr>
+      ${ynRow('Emergency control valve satisfactory', dc.installationGeneral.ecvSatisfactory)}
+      ${ynRow('Gas installation pipework satisfactory (visual)', dc.installationGeneral.pipeworkSatisfactory)}
+      ${ynRow('Meter / cylinder installation satisfactory (visual)', dc.installationGeneral.meterCylinderSatisfactory)}
+      ${ynRow('Gas installation correct materials used (visual)', dc.installationGeneral.correctMaterialsUsed)}
+      ${ynRow('Main protective bonding satisfactory (visual)', dc.installationGeneral.mainBondingSatisfactory)}
+      ${ynRow('Gas tightness test satisfactory', dc.installationGeneral.tightnessTestSatisfactory)}
+    </table>
+
+    <table class="pr-table">
+      <tr><th colspan="2">Details of other work carried out</th></tr>
+      <tr><td colspan="2">${esc(dc.otherWorkCarriedOut)||'—'}</td></tr>
+      <tr><th colspan="2">Observations / comments / remedial work required</th></tr>
+      <tr><td colspan="2">${esc(dc.observations)||'—'}</td></tr>
+      ${dc.warningNoticeSerial ? `<tr><td>Warning notice serial no.</td><td>${esc(dc.warningNoticeSerial)}</td></tr>` : ''}
+      <tr><td>Next safety check due before</td><td>${esc(dc.nextSafetyCheckDue)||'—'}</td></tr>
+    </table>
+
+    <table class="pr-table">
+      <tr><th colspan="2">Issued by</th><th colspan="2">Received by</th></tr>
+      <tr><td>Print name</td><td>${esc(dc.issuedBy.printName)}</td><td>Print name</td><td>${esc(dc.receivedBy.printName)}</td></tr>
+      <tr><td>Licence no.</td><td>${esc(dc.issuedBy.licenceNo)}</td><td>Role</td><td>${esc(dc.receivedBy.role)}</td></tr>
+      <tr><td>Signed</td><td>______________________</td><td>Signed</td><td>${dc.receivedBy.noOnePresent ? 'No one present at time of visit' : '______________________'}</td></tr>
+      <tr><td>Issue date</td><td>${esc(job.date)}</td><td></td><td></td></tr>
+    </table>
+    <p class="pr-note">I confirm the above has been carried out and recorded to the best of my knowledge.</p>
+  `;
+}
+function openPrintableDomesticRecord(job, jobAppliances){
+  const biz = getBusinessDetails();
+  showDocumentPreview('Domestic gas safety record preview', buildDomesticRecordHTML(job, jobAppliances, biz));
+}
+function ynRow(label, val){ return `<tr><td>${esc(label)}</td><td>${esc(val)||'—'}</td></tr>`; }
+function showDocumentPreview(title, html){
+  document.getElementById('recordOverlayTitle').textContent = title;
+  document.getElementById('printArea').innerHTML = html;
+  document.getElementById('recordOverlayBody').innerHTML = html;
+  document.getElementById('recordOverlay').classList.remove('hidden');
+}
+function openPrintableRecord(job, jobAppliances){
+  const biz = getBusinessDetails();
+  const completionKeys = job.applianceIds.length ? job.applianceIds : ['none'];
+  const sections = completionKeys.map(key=>{
+    const appliance = jobAppliances.find(a=>a.id===key) || null;
+    const c = job.completions[key];
+    return buildApplianceRecordSection(appliance, c);
+  }).join('<div class="divider" style="margin:24px 0;"></div>');
+  const html = `
+    <h1>Gas Safety Record</h1>
+    <p class="pr-note">Prepared by ${esc(biz.name)||'(business name not set)'} using Callout. This is a working record for the engineer's own files — refer to your official Gas Safe / OFTEC certificate for statutory compliance purposes.</p>
+    <table class="pr-table">
+      <tr><th colspan="2">Business</th><th colspan="2">Job / Customer</th></tr>
+      <tr><td>Name</td><td>${esc(biz.name)}</td><td>Name</td><td>${esc(job.customerName)}</td></tr>
+      <tr><td>Address</td><td>${esc(biz.address)}</td><td>Address</td><td>${esc(job.address)}</td></tr>
+      <tr><td>Phone</td><td>${esc(biz.phone)}</td><td>Phone</td><td>${esc(job.phone)}</td></tr>
+      <tr><td>Reg No.</td><td>${esc(biz.regNumber)}</td><td>Date</td><td>${esc(job.date)} ${esc(job.time)}</td></tr>
+    </table>
+    ${sections}
+  `;
+  showDocumentPreview('Safety record preview', html);
+}
+document.getElementById('closeRecordBtn').addEventListener('click', ()=> document.getElementById('recordOverlay').classList.add('hidden'));
+document.getElementById('printFromPreviewBtn').addEventListener('click', ()=> window.print());
+function buildApplianceRecordSection(appliance, c){
+  return `
+    <table class="pr-table">
+      <tr><th colspan="2">Appliance details</th></tr>
+      ${ynRow('Type', appliance ? appliance.applianceType : '')}
+      ${ynRow('Make', appliance ? appliance.make : '')}
+      ${ynRow('Model', appliance ? appliance.model : '')}
+      ${ynRow('Serial no.', appliance ? appliance.serial : '')}
+      ${ynRow('Location', appliance ? appliance.location : '')}
+      ${ynRow('Flue type', FLUE_TYPE_LABELS[c.ventilation.calcFlueType] || c.ventilation.calcFlueType)}
+    </table>
+    <table class="pr-table">
+      <tr><th>Combustion checks</th><th>Low fire</th><th>High fire</th></tr>
+      ${COMBUSTION_FIELDS.map(([key,label])=>`<tr><td>${esc(label)}</td><td>${esc(c.combustion.low[key])||'—'}</td><td>${esc(c.combustion.high[key])||'—'}</td></tr>`).join('')}
+    </table>
+    <table class="pr-table">
+      <tr><th colspan="2">General safety checks</th></tr>
+      ${ynRow('Compressor/booster working correctly', c.generalChecks.compressorOk)}
+      ${ynRow('Chimney installed to current standards', c.generalChecks.chimneyStandard)}
+      ${ynRow('Gas tightness test undertaken', c.generalChecks.tightnessTest)}
+      ${ynRow('Pipework sufficiently supported', c.generalChecks.pipeworkSupported)}
+      ${ynRow('Chimney termination satisfactory', c.generalChecks.chimneyTermination)}
+      ${ynRow('Fan-flue interlock opening correctly', c.generalChecks.fanFlueInterlock)}
+    </table>
+    <table class="pr-table">
+      <tr><th colspan="2">Ventilation</th></tr>
+      ${ynRow('Lower level free area (cm²)', c.ventilation.lowerFreeAreaCm2)}
+      ${ynRow('Higher level free area (cm²)', c.ventilation.higherFreeAreaCm2)}
+      ${ynRow('Natural ventilation satisfactory', c.ventilation.naturalSatisfactory)}
+      ${ynRow('Mechanical flow rate inlet (m³/s)', c.ventilation.mechFlowInlet)}
+      ${ynRow('Mechanical flow rate extract (m³/s)', c.ventilation.mechFlowExtract)}
+      ${ynRow('Mechanical ventilation satisfactory', c.ventilation.mechSatisfactory)}
+    </table>
+    <table class="pr-table">
+      <tr><th colspan="2">Extra checks</th></tr>
+      ${ynRow('Adequate ventilation', c.extraChecks.adequateVentilation)}
+      ${ynRow('Satisfactory spillage test', c.extraChecks.spillageTest)}
+      ${ynRow('Flue flow test satisfactory', c.extraChecks.flueFlowTest)}
+      ${ynRow('Air/gas pressure switch working', c.extraChecks.pressureSwitch)}
+      ${ynRow('Burner lock-out time', c.extraChecks.lockOutTime)}
+      ${ynRow('Temperature thermostats working', c.extraChecks.tempThermostats)}
+      ${ynRow('Limit thermostats working', c.extraChecks.limitThermostats)}
+      ${ynRow('Appliance serviced', c.extraChecks.serviced)}
+    </table>
+    <table class="pr-table">
+      <tr><th colspan="2">Installation pipework</th></tr>
+      ${ynRow('Line diagram present at meter', c.pipework.lineDiagramPresent)}
+      ${ynRow('Line diagram current', c.pipework.lineDiagramCurrent)}
+      ${ynRow('Emergency isolation valves fitted', c.pipework.isolationValvesFitted)}
+      ${ynRow('Valve handles in place & labelled', c.pipework.valveHandlesLabelled)}
+      ${ynRow('Pipework sealed & sleeved', c.pipework.pipeworkSealed)}
+      ${ynRow('Pipework colour coded / identified', c.pipework.pipeworkColourCoded)}
+      ${ynRow('Installation electrically bonded', c.pipework.electricallyBonded)}
+    </table>
+    <table class="pr-table">
+      <tr><th colspan="2">Meter installation</th></tr>
+      ${ynRow('Accessible', c.meter.accessible)}
+      ${ynRow('Compartment free from clutter', c.meter.clutterFree)}
+      ${ynRow('Compartment sufficiently ventilated', c.meter.ventilated)}
+      ${ynRow('Compartment secure', c.meter.secure)}
+      ${ynRow('Lock key clearly labelled', c.meter.keyLabelled)}
+    </table>
+    <table class="pr-table">
+      <tr><th colspan="2">Safety information</th></tr>
+      ${ynRow('CO alarm present', c.safetyInfo.coAlarmPresent)}
+      ${ynRow('Warning / advice notice issued', c.safetyInfo.warningNoticeIssued)}
+      ${ynRow('Warning labels attached', c.safetyInfo.warningLabelsAttached)}
+      ${ynRow('Responsible person advised', c.safetyInfo.responsiblePersonAdvised)}
+    </table>
+    <table class="pr-table">
+      <tr><th colspan="2">Summary</th></tr>
+      ${ynRow('Details of work carried out', c.workCarriedOut)}
+      ${ynRow('Remedial work needed', c.remedialWork)}
+      ${ynRow('Overall result', c.overallResult)}
+      ${ynRow('Remarks', c.remarks)}
+      ${ynRow('Next inspection due', c.nextInspection)}
+    </table>
+    <table class="pr-table">
+      <tr><th colspan="2">Declaration</th></tr>
+      ${ynRow('Engineer', c.engineerName)}
+      ${ynRow('Reg. No.', c.regNumber)}
+    </table>
+    <p class="pr-note">I confirm the above work has been carried out and recorded to the best of my knowledge. Signature: ______________________</p>
+  `;
+}
+function calcInvoiceTotals(inv){
+  const subtotal = inv.lineItems.reduce((s,i)=> s + (parseFloat(i.qty)||0)*(parseFloat(i.unitPrice)||0), 0);
+  const vat = inv.vatEnabled ? subtotal * ((parseFloat(inv.vatRate)||0)/100) : 0;
+  return { subtotal, vat, total: subtotal+vat };
+}
+function money(n){ return '£' + (isNaN(n)?0:n).toFixed(2); }
+function invoiceHTML(job, jobAppliances, customer, completionKeys){
+  completionKeys = completionKeys || (job.applianceIds.length ? job.applianceIds : ['none']);
+  const isDomestic = job.recordType === 'domestic';
+  const results = isDomestic
+    ? completionKeys.map(k=>job.domesticCompletion.applianceRows[k].safeToUse)
+    : completionKeys.map(k=>job.completions[k].overallResult);
+  const missing = results.filter(r=>!r).length;
+  if(missing){
+    return `<div class="card"><div class="empty">Complete the job completion form for ${completionKeys.length>1 ? `all ${completionKeys.length} appliances (${missing} still missing a result)` : 'this job'} first — the invoice draft pulls from it.</div></div>`;
+  }
+  const resultClassFor = (r)=> (r==='Safe to use'||r==='Yes') ? 'result-safe' : (r==='At Risk') ? 'result-atrisk' : (r==='Immediately Dangerous'||r==='No') ? 'result-id' : '';
+  const inv = job.invoice;
+  const t = calcInvoiceTotals(inv);
+  const locked = inv.status === 'approved';
+  return `<div class="card">
+    <label>Result${completionKeys.length>1?'s':''}</label>
+    ${completionKeys.map(k=>{
+      const a = jobAppliances.find(x=>x.id===k);
+      const label = a ? `${esc(a.make)} ${esc(a.model)}` : (completionKeys.length>1 ? 'General' : '');
+      const result = isDomestic ? job.domesticCompletion.applianceRows[k].safeToUse : job.completions[k].overallResult;
+      return `<div style="margin:4px 0;">${label?esc(label)+': ':''}<span class="result-pill ${resultClassFor(result)}">${esc(result)}</span></div>`;
+    }).join('')}
+    <div class="divider"></div>
+    <div class="grid2"><div><label>Bill to</label><div>${esc(job.customerName)}<br>${esc(job.address)}${customer && customer.email ? '<br>'+esc(customer.email):''}</div></div>
+    <div><label>Job</label><div>${esc(job.jobType)}${jobAppliances.length? ' — '+jobAppliances.map(a=>a.make+' '+a.model).join(', '):''}</div></div></div>
+  </div>
+
+  <div class="card">
+    <label>Line items</label>
+    ${locked ? `<p class="note">Approved — line items are locked. Click "Edit again (un-approve)" below to make changes.</p>` : ''}
+    <div id="lineItemsBody">
+      ${inv.lineItems.map(item=>`
+      <div class="grid3" style="align-items:end; margin-bottom:8px;" data-row="${item.id}">
+        <div class="field" style="margin-bottom:0;"><label>Description</label><input id="li_desc_${item.id}" value="${esc(item.description)}" placeholder="${esc(job.jobType)} — labour" ${locked?'disabled':''}></div>
+        <div class="field" style="margin-bottom:0;"><label>Qty</label><input id="li_qty_${item.id}" value="${esc(item.qty)}" inputmode="decimal" ${locked?'disabled':''}></div>
+        <div class="field" style="margin-bottom:0; display:flex; gap:6px; align-items:flex-end;">
+          <div style="flex:1;"><label>Unit price (£)</label><input id="li_price_${item.id}" value="${esc(item.unitPrice)}" inputmode="decimal" ${locked?'disabled':''}></div>
+          <button class="btn secondary small remove-li-btn" data-id="${item.id}" ${inv.lineItems.length<=1||locked?'disabled':''}>✕</button>
+        </div>
+      </div>`).join('')}
+    </div>
+    <button class="btn secondary small" id="addLineItemBtn" ${locked?'disabled':''}>+ Add line item</button>
+    <div class="divider"></div>
+    <div class="grid2">
+      <div class="field"><label><input type="checkbox" id="vatEnabled" ${inv.vatEnabled?'checked':''} ${locked?'disabled':''} style="width:auto; margin-right:6px;">Add VAT</label></div>
+      <div class="field" id="vatRateField" style="${inv.vatEnabled?'':'display:none;'}"><label>VAT rate (%)</label><input id="vatRate" value="${esc(inv.vatRate)}" inputmode="decimal" ${locked?'disabled':''}></div>
+    </div>
+    <div class="field"><label>Notes / payment terms</label><textarea id="invNotes" rows="2" ${locked?'disabled':''}>${esc(inv.notes)}</textarea></div>
+    <div id="invoiceTotals" class="note" style="font-size:14px; color:var(--ink);"></div>
+  </div>
+
+  <div class="card">
+    ${inv.status==='approved'
+      ? `<div class="note" style="color:var(--ok); font-weight:700;">✓ Approved — ready to send</div>
+         <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;">
+           <button class="btn secondary small" id="unapproveBtn">Edit again (un-approve)</button>
+           <button class="btn secondary small" id="previewInvoiceBtn">Preview / print invoice</button>
+           ${customer && customer.email ? `<button class="btn safety small" id="emailInvoiceBtn">Email to customer</button>` : `<span class="note">Add this customer's email to enable "Email to customer".</span>`}
+         </div>`
+      : `<p class="note"><strong>This is a draft.</strong> Nothing gets sent until you approve it — approving just marks it reviewed and ready; sending is still a separate, deliberate step.</p>
+         <div style="display:flex; gap:8px; flex-wrap:wrap;">
+           <button class="btn secondary small" id="saveInvoiceBtn">Save draft</button>
+           <button class="btn safety small" id="approveInvoiceBtn">Approve for sending</button>
+           <button class="btn secondary small" id="previewInvoiceBtn">Preview / print invoice</button>
+         </div>`
+    }
+  </div>`;
+}
+function readInvoiceFromForm(job){
+  const items = job.invoice.lineItems.map(item=>({
+    id: item.id,
+    description: document.getElementById('li_desc_'+item.id).value.trim(),
+    qty: document.getElementById('li_qty_'+item.id).value,
+    unitPrice: document.getElementById('li_price_'+item.id).value
+  }));
+  return {
+    lineItems: items,
+    vatEnabled: document.getElementById('vatEnabled').checked,
+    vatRate: document.getElementById('vatRate') ? document.getElementById('vatRate').value : job.invoice.vatRate,
+    notes: document.getElementById('invNotes').value,
+    status: job.invoice.status
+  };
+}
+function wireInvoice(job, jobAppliances, customer){
+  const main = document.getElementById('main');
+  const completionKeys = job.applianceIds.length ? job.applianceIds : ['none'];
+  const ready = job.recordType === 'domestic'
+    ? completionKeys.every(k=> job.domesticCompletion.applianceRows[k] && job.domesticCompletion.applianceRows[k].safeToUse)
+    : completionKeys.every(k=> job.completions[k] && job.completions[k].overallResult);
+  if(!ready) return;
+
+  function recalcTotalsDisplay(){
+    const draft = readInvoiceFromForm(job);
+    const t = calcInvoiceTotals(draft);
+    document.getElementById('invoiceTotals').innerHTML =
+      `Subtotal: ${money(t.subtotal)}${draft.vatEnabled ? `<br>VAT (${esc(draft.vatRate)||0}%): ${money(t.vat)}` : ''}<br><strong>Total: ${money(t.total)}</strong>`;
+  }
+  job.invoice.lineItems.forEach(item=>{
+    ['li_desc_','li_qty_','li_price_'].forEach(p=>{
+      const el = document.getElementById(p+item.id);
+      if(el) el.addEventListener('input', recalcTotalsDisplay);
+    });
+  });
+  document.getElementById('vatEnabled').addEventListener('change', (e)=>{
+    document.getElementById('vatRateField').style.display = e.target.checked ? '' : 'none';
+    recalcTotalsDisplay();
+  });
+  const vatRateInput = document.getElementById('vatRate');
+  if(vatRateInput) vatRateInput.addEventListener('input', recalcTotalsDisplay);
+  recalcTotalsDisplay();
+
+  document.getElementById('addLineItemBtn').addEventListener('click', ()=>{
+    job.invoice = readInvoiceFromForm(job);
+    job.invoice.lineItems.push({ id: uid('li'), description:'', qty:1, unitPrice:'' });
+    renderJobDetail(main);
+  });
+  main.querySelectorAll('.remove-li-btn').forEach(btn=> btn.addEventListener('click', ()=>{
+    job.invoice = readInvoiceFromForm(job);
+    job.invoice.lineItems = job.invoice.lineItems.filter(i=>i.id!==btn.dataset.id);
+    if(!job.invoice.lineItems.length) job.invoice.lineItems.push({ id: uid('li'), description:'', qty:1, unitPrice:'' });
+    renderJobDetail(main);
+  }));
+
+  const saveBtn = document.getElementById('saveInvoiceBtn');
+  if(saveBtn) saveBtn.addEventListener('click', async ()=>{
+    job.invoice = readInvoiceFromForm(job); job.invoice.status = 'draft';
+    await saveJob(job); renderJobDetail(main);
+  });
+  const approveBtn = document.getElementById('approveInvoiceBtn');
+  if(approveBtn) approveBtn.addEventListener('click', async ()=>{
+    job.invoice = readInvoiceFromForm(job); job.invoice.status = 'approved';
+    await saveJob(job); renderJobDetail(main);
+  });
+  const unapproveBtn = document.getElementById('unapproveBtn');
+  if(unapproveBtn) unapproveBtn.addEventListener('click', async ()=>{
+    job.invoice.status = 'draft'; await saveJob(job); renderJobDetail(main);
+  });
+  const previewBtn = document.getElementById('previewInvoiceBtn');
+  if(previewBtn) previewBtn.addEventListener('click', ()=>{
+    if(job.invoice.status==='draft') job.invoice = Object.assign(readInvoiceFromForm(job), { status:'draft' });
+    openPrintableInvoice(job, jobAppliances, customer);
+  });
+  const emailBtn = document.getElementById('emailInvoiceBtn');
+  if(emailBtn) emailBtn.addEventListener('click', ()=>{
+    const t = calcInvoiceTotals(job.invoice);
+    const biz = getBusinessDetails();
+    const subject = `Invoice from ${biz.name||'your engineer'} — ${job.customerName}`;
+    const body = `Hi ${job.customerName},\n\nPlease find your invoice for the ${job.jobType.toLowerCase()} on ${job.date||'(date)'}.\n\nTotal due: ${money(t.total)}\n\nA copy of the full invoice is attached — please attach the saved PDF before sending (use "Preview / print invoice" → Save as PDF).\n\nThanks,\n${biz.name||''}`;
+    window.location.href = `mailto:${encodeURIComponent(customer.email)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  });
+}
+function openPrintableInvoice(job, jobAppliances, customer){
+  const biz = getBusinessDetails();
+  const t = calcInvoiceTotals(job.invoice);
+  const html = `
+    <h1>Invoice ${job.invoice.status==='approved' ? '' : '(DRAFT)'}</h1>
+    <p class="pr-note">${esc(biz.name)||'(business name not set)'} — this draft was prepared using Callout and should be checked before sending.</p>
+    <table class="pr-table">
+      <tr><th colspan="2">From</th><th colspan="2">Bill to</th></tr>
+      <tr><td>Business</td><td>${esc(biz.name)}</td><td>Customer</td><td>${esc(job.customerName)}</td></tr>
+      <tr><td>Address</td><td>${esc(biz.address)}</td><td>Address</td><td>${esc(job.address)}</td></tr>
+      <tr><td>Phone</td><td>${esc(biz.phone)}</td><td>Email</td><td>${esc(customer && customer.email)}</td></tr>
+      <tr><td>Reg No.</td><td>${esc(biz.regNumber)}</td><td>Date</td><td>${esc(job.date)}</td></tr>
+    </table>
+    <table class="pr-table">
+      <tr><th>Description</th><th>Qty</th><th>Unit price</th><th>Line total</th></tr>
+      ${job.invoice.lineItems.map(i=>`<tr><td>${esc(i.description)||'—'}</td><td>${esc(i.qty)}</td><td>${money(parseFloat(i.unitPrice)||0)}</td><td>${money((parseFloat(i.qty)||0)*(parseFloat(i.unitPrice)||0))}</td></tr>`).join('')}
+    </table>
+    <table class="pr-table">
+      <tr><td>Subtotal</td><td>${money(t.subtotal)}</td></tr>
+      ${job.invoice.vatEnabled ? `<tr><td>VAT (${esc(job.invoice.vatRate)}%)</td><td>${money(t.vat)}</td></tr>` : ''}
+      <tr><td><strong>Total due</strong></td><td><strong>${money(t.total)}</strong></td></tr>
+    </table>
+    ${job.invoice.notes ? `<p class="pr-note">${esc(job.invoice.notes)}</p>` : ''}
+  `;
+  showDocumentPreview('Invoice preview', html);
 }
 
 render();
 </script>
+
 </body>
 </html>
