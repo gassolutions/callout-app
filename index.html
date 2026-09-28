@@ -411,7 +411,7 @@ function extractJson(text){
 async function scanBadgePhoto(base64, mediaType){
   const data = await callClaude([{ role:"user", content:[
     { type:"image", source:{ type:"base64", media_type: mediaType, data: base64 } },
-    { type:"text", text:"This is a photo of a boiler or appliance data badge. Extract the manufacturer (make), model name/number, and serial number if visible. Respond with ONLY a JSON object: {\"make\":\"\",\"model\":\"\",\"serial\":\"\"}. Use an empty string for anything not legible." }
+    { type:"text", text:"This is a photo of a boiler or appliance data badge. Extract the manufacturer (make), model name/number, and serial number if visible. A badge often shows several different numbers or codes on it (a batch/traceability code, a manufacture date, a Gas Council number, etc.) — read carefully to find the actual serial number rather than just the first or longest number you see, and don't confuse it with a nearby date (DD/MM/YY) or short batch code.\n\nKnown badge convention: on Ideal Boilers badges (e.g. Evomax, Logic, Exclusive ranges), the serial number starts with a 3-letter code beginning with 'A' (this varies by badge — ACK, AFQ and AET have all been seen, so match the pattern of a 3-letter 'A..' code followed by a long number, not one fixed code) immediately followed by a long number (commonly 14 digits). Both parts together are the serial number — include the 3 letters as part of it (e.g. ACK2059670000439), don't drop them.\n\nRespond with ONLY a JSON object: {\"make\":\"\",\"model\":\"\",\"serial\":\"\"}. Use an empty string for anything not legible." }
   ]}]);
   const block = (data.content||[]).find(c=>c.type==='text');
   if(!block) throw new Error('no text in response');
@@ -556,7 +556,7 @@ const FLUE_TYPE_LABELS = {
   'flueless': 'Flueless'
 };
 const APPLIANCE_TYPES = [
-  'Gas Combi Boiler','Gas System Boiler','Gas Regular (Heat-only) Boiler','Gas Back Boiler','LPG Boiler',
+  'Gas Combi Boiler','Gas System Boiler','Gas Regular (Heat-only) Boiler','Gas Back Boiler',
   'Commercial/Industrial Packaged Boiler','Steam Boiler',
   'OFTEC Oil Combi Boiler','OFTEC Oil Regular Boiler','Electric Boiler',
   'Radiant Tube Heater','Radiant Plaque Heater',
@@ -565,6 +565,8 @@ const APPLIANCE_TYPES = [
   'Gas Fired Water Heater','Commercial Catering Equipment','LPG Vaporiser',
   'Other appliance'
 ];
+const FUEL_TYPES = ['Natural Gas','LPG','Butane'];
+const NO_FUEL_SELECT_TYPES = ['OFTEC Oil Combi Boiler','OFTEC Oil Regular Boiler','Electric Boiler','LPG Vaporiser'];
 const COMBUSTION_FIELDS = [
   ['heatInputKW','Heat input rate (kW)'], ['burnerPressureMbar','Gas pressure (mbar, manual)'], ['gasRateM3hr','Rate of gas (m³/hr)'],
   ['roomTempC','Room temperature (°C)'], ['flueGasTempC','Flue gas temperature (°C)'], ['flueGasTempNetC','Flue gas temp NET (°C)'],
@@ -582,26 +584,34 @@ const HAZARDS_BY_TYPE = {
 function ramsTemplate(job, appliances, manualRefs){
   appliances = appliances || [];
   manualRefs = manualRefs || {};
-  const hazards = HAZARDS_BY_TYPE[job.jobType] || HAZARDS_BY_TYPE['Service'];
+  const applianceJobTypes = job.applianceJobTypes || {};
+  const effectiveType = (a) => applianceJobTypes[a.id] || job.jobType;
+  const distinctTypes = appliances.length ? [...new Set(appliances.map(effectiveType))] : [job.jobType];
   const applianceLines = appliances.length
     ? appliances.map(a=>{
         const ref = manualRefs[a.id];
         const refLine = ref && (ref.chapter || ref.page)
           ? ` — manual reference: ${ref.chapter||'see manual'}${ref.page?', page '+ref.page:''}`
           : '';
-        return `- ${a.make} ${a.model} (${a.applianceType}), serial ${a.serial||'not recorded'}${refLine}`;
+        const typeNote = effectiveType(a) !== job.jobType ? ` [${effectiveType(a)}]` : '';
+        return `- ${a.make} ${a.model} (${a.applianceType})${typeNote}, serial ${a.serial||'not recorded'}${refLine}`;
       }).join('\n')
     : '- appliance not yet linked';
   const applianceNameList = appliances.length ? appliances.map(a=>a.make+' '+a.model).join(', ') : 'the appliance(s)';
+  const hazardsText = distinctTypes.map(t=>{
+    const hazards = HAZARDS_BY_TYPE[t] || HAZARDS_BY_TYPE['Service'];
+    const heading = distinctTypes.length > 1 ? `${t}:\n` : '';
+    return heading + hazards.map(h=>'- '+h).join('\n');
+  }).join('\n\n');
   return `RISK ASSESSMENT & METHOD STATEMENT
 Job: ${job.jobType} — ${job.customerName}
 Site address: ${job.address}
 Appliance(s):
 ${applianceLines}
-Date: ${job.date || '(not set)'}
+Date: ${job.date || '(not set)'}${job.multiDay && job.endDate ? ' to '+job.endDate : ''}
 
 IDENTIFIED HAZARDS
-${hazards.map(h=>'- '+h).join('\n')}
+${hazardsText}
 
 CONTROL MEASURES
 - Isolate gas supply at the meter/appliance valve before disturbing pipework or components.
@@ -670,6 +680,9 @@ function ensureJobShape(job){
     delete job.applianceId;
   }
   if(!Array.isArray(job.applianceIds)) job.applianceIds = [];
+  if(typeof job.multiDay !== 'boolean') job.multiDay = false;
+  if(typeof job.endDate !== 'string') job.endDate = '';
+  if(!job.applianceJobTypes || typeof job.applianceJobTypes !== 'object') job.applianceJobTypes = {};
 
   // migrate single completion -> one completion per appliance
   if(job.completion){
@@ -744,7 +757,7 @@ function ensureInvoiceShape(job){
 function newBlankJob(){
   return {
     id: uid('job'), customerId:'', customerName:'', phone:'', address:'', applianceIds:[],
-    date:'', time:'', durationMinutes:60, jobType:'Service', status:'Scheduled', notes:'', ramsText:'',
+    date:'', time:'', durationMinutes:60, multiDay:false, endDate:'', jobType:'Service', applianceJobTypes:{}, status:'Scheduled', notes:'', ramsText:'',
     invoice: defaultInvoice(),
     completions: { none: defaultCompletion() },
     manualRefs: {},
@@ -838,7 +851,7 @@ async function renderCustomers(main){
       <div class="customer-body ${expanded?'':'hidden'}">
         ${theirAppliances.map(a=>`<div class="appliance-row">
           <div><div class="t">${esc(a.applianceType)} — ${esc(a.make)} ${esc(a.model)}</div>
-          <div class="m">Serial: ${esc(a.serial)||'—'} ${a.manual? '· <a href="'+esc(a.manual)+'" target="_blank">manual</a>':'· no manual link yet'}</div></div>
+          <div class="m">Serial: ${esc(a.serial)||'—'} ${a.fuelType && a.fuelType!=='Natural Gas' ? '· '+esc(a.fuelType) : ''} ${a.manual? '· <a href="'+esc(a.manual)+'" target="_blank">manual</a>':'· no manual link yet'}</div></div>
           <button class="btn secondary small" data-editap="${a.id}" data-editcust="${c.id}">Edit</button>
         </div>`).join('') || '<div class="note">No appliances added yet.</div>'}
         <button class="btn secondary small" style="margin-top:12px;" data-addap="${c.id}">+ Add appliance</button>
@@ -871,11 +884,16 @@ async function renderCustomers(main){
 function applianceFormHTML(appliance){
   const a = appliance || {};
   const isEdit = !!appliance;
+  const fuelType = a.fuelType || 'Natural Gas';
+  const hideFuel = NO_FUEL_SELECT_TYPES.includes(a.applianceType);
   return `<div class="apform">
     <div class="field"><label>Appliance type</label>
       <select id="ap_type"><option value="">— choose type —</option>${APPLIANCE_TYPES.map(t=>`<option ${t===a.applianceType?'selected':''}>${t}</option>`).join('')}</select>
     </div>
     <div id="ap_details" class="${isEdit?'':'hidden'}">
+      <div class="field" id="ap_fuel_field" style="${hideFuel?'display:none;':''}"><label>Fuel type</label>
+        <select id="ap_fuel">${FUEL_TYPES.map(f=>`<option ${f===fuelType?'selected':''}>${f}</option>`).join('')}</select>
+      </div>
       <div class="grid2">
         <div class="field"><label>Make</label><input id="ap_make" value="${esc(a.make)}"></div>
         <div class="field"><label>Model</label><input id="ap_model" value="${esc(a.model)}"></div>
@@ -914,7 +932,11 @@ function applianceFormHTML(appliance){
 function wireApplianceForm(customerId, main, existingAppliance){
   const typeSel = document.getElementById('ap_type');
   const details = document.getElementById('ap_details');
-  typeSel.addEventListener('change', ()=> details.classList.toggle('hidden', !typeSel.value));
+  typeSel.addEventListener('change', ()=>{
+    details.classList.toggle('hidden', !typeSel.value);
+    const fuelField = document.getElementById('ap_fuel_field');
+    if(fuelField) fuelField.style.display = NO_FUEL_SELECT_TYPES.includes(typeSel.value) ? 'none' : '';
+  });
 
   document.getElementById('cancelApplianceBtn').addEventListener('click', ()=>{
     state.addingApplianceFor = null; badgeImageData = null; manualSearchResult = null; editingAppliance = null; renderCustomers(main);
@@ -1003,6 +1025,7 @@ function wireApplianceForm(customerId, main, existingAppliance){
     }
     const a = {
       id: existingAppliance ? existingAppliance.id : uid('ap'), customerId, applianceType, make, model,
+      fuelType: NO_FUEL_SELECT_TYPES.includes(applianceType) ? '' : (document.getElementById('ap_fuel').value || 'Natural Gas'),
       serial: document.getElementById('ap_serial').value.trim(),
       location: document.getElementById('ap_location').value.trim(),
       notes: document.getElementById('ap_notes').value.trim(),
@@ -1062,12 +1085,20 @@ async function renderNewJob(main){
           <option value="480">Full day</option>
         </select>
       </div>
+      <div class="field"><label><input type="checkbox" id="j_multiday" style="width:auto; margin-right:6px;">This job spans multiple days</label></div>
+      <div class="field hidden" id="j_enddate_field"><label>End date</label><input type="date" id="j_enddate"></div>
       <div class="field"><label>Appliance(s)</label>
         ${!selectedId ? `<div class="note">Choose a customer first.</div>` : appliances.length ? `
         <div class="apform">
-          ${appliances.map(a=>`<label style="display:flex; align-items:center; gap:8px; padding:4px 0; font-size:14px; font-weight:400; color:var(--ink);">
-            <input type="checkbox" class="j-appliance-cb" value="${a.id}" style="width:auto;"> ${esc(a.applianceType)} — ${esc(a.make)} ${esc(a.model)}
-          </label>`).join('')}
+          ${appliances.map(a=>`<div style="padding:6px 0;">
+            <label style="display:flex; align-items:center; gap:8px; font-size:14px; font-weight:400; color:var(--ink);">
+              <input type="checkbox" class="j-appliance-cb" value="${a.id}" style="width:auto;"> ${esc(a.applianceType)} — ${esc(a.make)} ${esc(a.model)}
+            </label>
+            <select class="j-appliance-jobtype" data-appliance="${a.id}" style="margin-top:4px; margin-left:26px; width:calc(100% - 26px);">
+              <option value="">(same as job type above)</option>
+              ${JOB_TYPES.map(t=>`<option>${t}</option>`).join('')}
+            </select>
+          </div>`).join('')}
         </div>` : '<div class="note">This customer has no appliances on file yet — add one from the Customers tab.</div>'}
       </div>
       <div class="field"><label>Notes</label><textarea id="j_notes" rows="2">${esc(prefillNotes)}</textarea></div>
@@ -1077,6 +1108,13 @@ async function renderNewJob(main){
   `;
   if(!customers.length) return;
   document.getElementById('j_customer').addEventListener('change', (e)=>{ state.newJobCustomerId = e.target.value; renderNewJob(main); });
+  const multiDayCb = document.getElementById('j_multiday');
+  const enddateField = document.getElementById('j_enddate_field');
+  const durationField = document.getElementById('j_duration').closest('.field');
+  multiDayCb.addEventListener('change', ()=>{
+    enddateField.classList.toggle('hidden', !multiDayCb.checked);
+    durationField.classList.toggle('hidden', multiDayCb.checked);
+  });
   document.getElementById('createJobBtn').addEventListener('click', async ()=>{
     const customerId = document.getElementById('j_customer').value;
     const customer = customers.find(c=>c.id===customerId);
@@ -1085,10 +1123,21 @@ async function renderNewJob(main){
     job.customerId = customer.id; job.customerName = customer.name; job.phone = customer.phone; job.address = customer.address;
     job.date = document.getElementById('j_date').value;
     job.time = document.getElementById('j_time').value;
-    job.durationMinutes = parseInt(document.getElementById('j_duration').value) || 60;
+    job.multiDay = multiDayCb.checked;
+    if(job.multiDay){
+      job.endDate = document.getElementById('j_enddate').value;
+      job.durationMinutes = 0;
+    } else {
+      job.endDate = '';
+      job.durationMinutes = parseInt(document.getElementById('j_duration').value) || 60;
+    }
     job.jobType = document.getElementById('j_type').value;
     job.recordType = document.getElementById('j_recordtype').value;
     job.applianceIds = Array.from(main.querySelectorAll('.j-appliance-cb:checked')).map(cb=>cb.value);
+    job.applianceJobTypes = {};
+    main.querySelectorAll('.j-appliance-jobtype').forEach(sel=>{
+      if(job.applianceIds.includes(sel.dataset.appliance) && sel.value) job.applianceJobTypes[sel.dataset.appliance] = sel.value;
+    });
     job.notes = document.getElementById('j_notes').value.trim();
     const linkedAppliances = appliances.filter(a=>job.applianceIds.includes(a.id));
     job.completions = {};
@@ -1176,7 +1225,8 @@ async function renderJobDetail(main){
       if(completionKeys.length > 1){
         html += `<div class="tabs" style="margin-bottom:14px;">${completionKeys.map(k=>{
           const a = jobAppliances.find(x=>x.id===k);
-          const label = a ? `${esc(a.applianceType)} — ${esc(a.make)} ${esc(a.model)}` : 'General';
+          const effType = a && job.applianceJobTypes && job.applianceJobTypes[a.id];
+          const label = a ? `${esc(a.applianceType)} — ${esc(a.make)} ${esc(a.model)}${effType && effType!==job.jobType ? ' ('+esc(effType)+')' : ''}` : 'General';
           return `<button data-akey="${k}" class="${k===state.completionApplianceKey?'active':''}">${label}</button>`;
         }).join('')}</div>`;
       }
@@ -1279,20 +1329,36 @@ function showBusinessOverlay(onSaved){
 async function addJobToCalendar(job){
   if(!gcalToken){ alert('Connect Google Calendar from the Calendar tab first.'); return; }
   if(!job.date){ alert('Add a date to this job first (Overview tab has no date field yet — set it when creating the job).'); return; }
+  if(job.multiDay && !job.endDate){ alert('Add an end date to this job first (Edit details).'); return; }
   await loadGapiClient();
   gapi.client.setToken({ access_token: gcalToken });
-  const start = new Date(`${job.date}T${job.time || '09:00'}:00`);
-  const end = new Date(start.getTime() + (job.durationMinutes || 60)*60*1000);
+  let eventResource;
+  if(job.multiDay){
+    // Google Calendar all-day events use an exclusive end date, so add one day to the last actual day
+    const endExclusive = new Date(`${job.endDate}T00:00:00`);
+    endExclusive.setDate(endExclusive.getDate() + 1);
+    eventResource = {
+      summary: `${job.jobType} — ${job.customerName}`,
+      location: job.address,
+      description: job.notes || '',
+      start: { date: job.date },
+      end: { date: endExclusive.toISOString().slice(0,10) }
+    };
+  } else {
+    const start = new Date(`${job.date}T${job.time || '09:00'}:00`);
+    const end = new Date(start.getTime() + (job.durationMinutes || 60)*60*1000);
+    eventResource = {
+      summary: `${job.jobType} — ${job.customerName}`,
+      location: job.address,
+      description: job.notes || '',
+      start: { dateTime: start.toISOString() },
+      end: { dateTime: end.toISOString() }
+    };
+  }
   try{
     const resp = await gapi.client.calendar.events.insert({
       calendarId: 'primary',
-      resource: {
-        summary: `${job.jobType} — ${job.customerName}`,
-        location: job.address,
-        description: job.notes || '',
-        start: { dateTime: start.toISOString() },
-        end: { dateTime: end.toISOString() }
-      }
+      resource: eventResource
     });
     job.calendarEventId = resp.result.id;
     await saveJob(job);
@@ -1310,18 +1376,20 @@ function formatDuration(mins){
   return (mins/60).toFixed(1).replace('.0','') + ' hours';
 }
 function overviewHTML(job, jobAppliances){
+  const applianceJobTypes = job.applianceJobTypes || {};
   return `<div class="card">
     <div class="grid2"><div><label>Customer</label><div>${esc(job.customerName)}</div></div><div><label>Phone</label><div>${esc(job.phone)||'—'}</div></div></div>
     <div class="divider"></div>
-    <div class="grid2"><div><label>Date / time</label><div>${esc(job.date)||'—'} ${esc(job.time)||''}</div></div><div><label>Job type</label><div>${esc(job.jobType)}</div></div></div>
+    <div class="grid2"><div><label>Date${job.multiDay?' range':' / time'}</label><div>${job.multiDay ? `${esc(job.date)||'—'} to ${esc(job.endDate)||'—'}` : `${esc(job.date)||'—'} ${esc(job.time)||''}`}</div></div><div><label>Job type</label><div>${esc(job.jobType)}</div></div></div>
     <div class="divider"></div>
-    <div><label>Estimated duration</label><div>${formatDuration(job.durationMinutes)}</div></div>
+    <div><label>${job.multiDay?'Duration':'Estimated duration'}</label><div>${job.multiDay ? 'Multiple days' : formatDuration(job.durationMinutes)}</div></div>
     <div class="divider"></div>
     <label>Appliance(s)</label>
     ${jobAppliances.length ? jobAppliances.map(appliance=>`
     <div style="padding:8px 0; border-bottom:1px solid var(--line);">
-      <div>${esc(appliance.applianceType)} — ${esc(appliance.make)} ${esc(appliance.model)}</div>
+      <div>${esc(appliance.applianceType)} — ${esc(appliance.make)} ${esc(appliance.model)}${applianceJobTypes[appliance.id] && applianceJobTypes[appliance.id]!==job.jobType ? ` <span class="note">(${esc(applianceJobTypes[appliance.id])})</span>` : ''}</div>
       ${appliance.serial ? `<div class="note">Serial: ${esc(appliance.serial)}</div>` : ''}
+      ${appliance.fuelType && appliance.fuelType!=='Natural Gas' ? `<div class="note">Fuel: ${esc(appliance.fuelType)}</div>` : ''}
       ${appliance.manual ? `<div class="note"><a href="${esc(appliance.manual)}" target="_blank">Open manufacturer instructions (PDF)</a></div>` : ''}
       ${appliance.manualNote ? `<div class="note" style="white-space:pre-line;">${esc(appliance.manualNote)}</div>` : ''}
       ${appliance.notes ? `<div class="note">Common faults / notes: ${esc(appliance.notes)}</div>` : ''}
@@ -1336,6 +1404,7 @@ function overviewHTML(job, jobAppliances){
   </div>`;
 }
 function editJobHTML(job, customerAppliances){
+  const applianceJobTypes = job.applianceJobTypes || {};
   return `<div class="card">
     <p class="note">Customer stays fixed once a job's created — for these fields, though, feel free to correct anything.</p>
     <div class="grid3">
@@ -1354,11 +1423,19 @@ function editJobHTML(job, customerAppliances){
         ${[[30,'30 minutes'],[60,'1 hour'],[90,'1.5 hours'],[120,'2 hours'],[180,'3 hours'],[240,'4 hours'],[480,'Full day']].map(([v,l])=>`<option value="${v}" ${v===job.durationMinutes?'selected':''}>${l}</option>`).join('')}
       </select>
     </div>
+    <div class="field"><label><input type="checkbox" id="ej_multiday" style="width:auto; margin-right:6px;" ${job.multiDay?'checked':''}>This job spans multiple days</label></div>
+    <div class="field ${job.multiDay?'':'hidden'}" id="ej_enddate_field"><label>End date</label><input type="date" id="ej_enddate" value="${esc(job.endDate)}"></div>
     <div class="field"><label>Appliance(s)</label>
       ${customerAppliances.length ? `<div class="apform">
-        ${customerAppliances.map(a=>`<label style="display:flex; align-items:center; gap:8px; padding:4px 0; font-size:14px; font-weight:400; color:var(--ink);">
-          <input type="checkbox" class="ej-appliance-cb" value="${a.id}" style="width:auto;" ${job.applianceIds.includes(a.id)?'checked':''}> ${esc(a.applianceType)} — ${esc(a.make)} ${esc(a.model)}
-        </label>`).join('')}
+        ${customerAppliances.map(a=>`<div style="padding:6px 0;">
+          <label style="display:flex; align-items:center; gap:8px; font-size:14px; font-weight:400; color:var(--ink);">
+            <input type="checkbox" class="ej-appliance-cb" value="${a.id}" style="width:auto;" ${job.applianceIds.includes(a.id)?'checked':''}> ${esc(a.applianceType)} — ${esc(a.make)} ${esc(a.model)}
+          </label>
+          <select class="ej-appliance-jobtype" data-appliance="${a.id}" style="margin-top:4px; margin-left:26px; width:calc(100% - 26px);">
+            <option value="">(same as job type above)</option>
+            ${JOB_TYPES.map(t=>`<option ${applianceJobTypes[a.id]===t?'selected':''}>${t}</option>`).join('')}
+          </select>
+        </div>`).join('')}
       </div>` : '<div class="note">This customer has no appliances on file — add one from the Customers tab first.</div>'}
     </div>
     <div class="field"><label>Notes</label><textarea id="ej_notes" rows="3">${esc(job.notes)}</textarea></div>
@@ -1375,14 +1452,33 @@ function wireOverview(job, main){
 }
 function wireEditJob(job, main){
   document.getElementById('cancelJobEditBtn').addEventListener('click', ()=>{ state.editingJob = false; renderJobDetail(main); });
+  const multiDayCb = document.getElementById('ej_multiday');
+  const enddateField = document.getElementById('ej_enddate_field');
+  const durationField = document.getElementById('ej_duration').closest('.field');
+  const syncMultiDay = ()=>{
+    enddateField.classList.toggle('hidden', !multiDayCb.checked);
+    durationField.classList.toggle('hidden', multiDayCb.checked);
+  };
+  multiDayCb.addEventListener('change', syncMultiDay);
+  syncMultiDay();
   document.getElementById('saveJobEditBtn').addEventListener('click', async ()=>{
     job.date = document.getElementById('ej_date').value;
     job.time = document.getElementById('ej_time').value;
     job.jobType = document.getElementById('ej_type').value;
     job.recordType = document.getElementById('ej_recordtype').value;
-    job.durationMinutes = parseInt(document.getElementById('ej_duration').value) || 60;
+    job.multiDay = multiDayCb.checked;
+    if(job.multiDay){
+      job.endDate = document.getElementById('ej_enddate').value;
+    } else {
+      job.durationMinutes = parseInt(document.getElementById('ej_duration').value) || 60;
+      job.endDate = '';
+    }
     const newIds = Array.from(main.querySelectorAll('.ej-appliance-cb:checked')).map(cb=>cb.value);
     job.applianceIds = newIds;
+    job.applianceJobTypes = {};
+    main.querySelectorAll('.ej-appliance-jobtype').forEach(sel=>{
+      if(newIds.includes(sel.dataset.appliance) && sel.value) job.applianceJobTypes[sel.dataset.appliance] = sel.value;
+    });
     job.notes = document.getElementById('ej_notes').value.trim();
     // keep completion data for appliances still linked, add blank ones for newly added appliances, fall back to "none" if all removed
     const keys = newIds.length ? newIds : ['none'];
@@ -1425,7 +1521,8 @@ function wireRams(job){
     statusEl.textContent = `Looking up ${withManuals.length} manual${withManuals.length>1?'s':''}...`;
     for(const a of withManuals){
       try{
-        const ref = await findManualSection(a.make, a.model, a.manual, job.jobType);
+        const effectiveType = (job.applianceJobTypes && job.applianceJobTypes[a.id]) || job.jobType;
+        const ref = await findManualSection(a.make, a.model, a.manual, effectiveType);
         job.manualRefs[a.id] = ref;
       }catch(e){
         job.manualRefs[a.id] = { chapter:'', page:'', note:'Lookup failed — try again or check the manual manually.' };
@@ -1878,7 +1975,8 @@ function domesticCompletionHTML(job, jobAppliances, completionKeys){
   ${completionKeys.map(key=>{
     const appliance = jobAppliances.find(a=>a.id===key) || null;
     const r = dc.applianceRows[key];
-    const label = appliance ? `${esc(appliance.applianceType)} — ${esc(appliance.make)} ${esc(appliance.model)}` : 'General (no appliance linked)';
+    const effType = appliance && job.applianceJobTypes && job.applianceJobTypes[key];
+    const label = appliance ? `${esc(appliance.applianceType)} — ${esc(appliance.make)} ${esc(appliance.model)}${effType && effType!==job.jobType ? ' ('+esc(effType)+')' : ''}` : 'General (no appliance linked)';
     const ynSel = (id,val) => `<select id="${id}"><option value="">—</option><option ${val==='Yes'?'selected':''}>Yes</option><option ${val==='No'?'selected':''}>No</option></select>`;
     const ynNaSel = (id,val) => `<select id="${id}"><option value="">—</option><option ${val==='Yes'?'selected':''}>Yes</option><option ${val==='No'?'selected':''}>No</option><option ${val==='N/A'?'selected':''}>N/A</option></select>`;
     const passFailNaSel = (id,val) => `<select id="${id}"><option value="">—</option><option ${val==='Pass'?'selected':''}>Pass</option><option ${val==='Fail'?'selected':''}>Fail</option><option ${val==='N/A'?'selected':''}>N/A</option></select>`;
@@ -2146,11 +2244,12 @@ function buildDomesticRecordHTML(job, jobAppliances, biz){
     </table>
 
     <table class="pr-grid">
-      <tr><th colspan="7">Appliance details</th></tr>
-      <tr><th>Location</th><th>Appliance type</th><th>Make</th><th>Model</th><th>Chimney/flue type</th><th>Landlord's appliance</th><th>Appliance checked</th></tr>
+      <tr><th colspan="8">Appliance details</th></tr>
+      <tr><th>Location</th><th>Appliance type</th><th>Fuel</th><th>Make</th><th>Model</th><th>Chimney/flue type</th><th>Landlord's appliance</th><th>Appliance checked</th></tr>
       ${rows.map(({appliance,r})=>`<tr>
         <td>${appliance?esc(appliance.location):'—'}</td>
         <td>${appliance?esc(appliance.applianceType):'—'}</td>
+        <td>${appliance?esc(appliance.fuelType || (NO_FUEL_SELECT_TYPES.includes(appliance.applianceType)?'':'Natural Gas')):'—'}</td>
         <td>${appliance?esc(appliance.make):'—'}</td>
         <td>${appliance?esc(appliance.model):'—'}</td>
         <td>${esc(r.chimneyFlueType)||'—'}</td>
@@ -2265,6 +2364,7 @@ function buildApplianceRecordSection(appliance, c){
     <table class="pr-table">
       <tr><th colspan="2">Appliance details</th></tr>
       ${ynRow('Type', appliance ? appliance.applianceType : '')}
+      ${ynRow('Fuel type', appliance ? (appliance.fuelType || (NO_FUEL_SELECT_TYPES.includes(appliance.applianceType) ? '' : 'Natural Gas')) : '')}
       ${ynRow('Make', appliance ? appliance.make : '')}
       ${ynRow('Model', appliance ? appliance.model : '')}
       ${ynRow('Serial no.', appliance ? appliance.serial : '')}
