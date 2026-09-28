@@ -121,6 +121,7 @@
   <span>Saved on this device only — use Export/Import to carry data to your phone.</span>
   <button class="btn small secondary" id="exportBtn">Export backup</button>
   <button class="btn small secondary" id="importBtn">Import backup</button>
+  <button class="btn small secondary" id="driveBtn">Google Drive backup</button>
 </div>
 <div id="backupOverlay" class="hidden" style="position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:50; display:flex; align-items:center; justify-content:center; padding:20px;">
   <div class="card" style="max-width:600px; width:100%; max-height:80vh; overflow:auto;">
@@ -298,6 +299,149 @@ function showImportOverlay(){
 document.getElementById('exportBtn').addEventListener('click', showExportOverlay);
 document.getElementById('importBtn').addEventListener('click', showImportOverlay);
 document.getElementById('closeBackupBtn').addEventListener('click', ()=> document.getElementById('backupOverlay').classList.add('hidden'));
+
+
+// ---- Google Drive backup / restore ----
+// Uses the drive.file scope, so the app can only see files it created itself (not the rest of your Drive).
+const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
+const DRIVE_BACKUP_PREFIX = 'callout-backup-';
+let gdriveToken = null;
+let gdriveTokenClient = null;
+let driveOverlayMsg = '';
+
+function driveErrorMessage(err){
+  const status = err && (err.status || (err.result && err.result.error && err.result.error.code));
+  const msg = (err && err.result && err.result.error && err.result.error.message) || (err && err.message) || '';
+  if(status === 401){ gdriveToken = null; return 'Your Google Drive session expired — connect again.'; }
+  if(status === 403 && /has not been used|disabled|accessNotConfigured/i.test(msg)) return 'The Drive API isn\'t switched on yet in your Google Cloud project — enable "Google Drive API" there, then try again.';
+  if(status === 403) return 'Google refused the request (403). Check the Drive API is enabled and the drive.file permission was granted when you connected.';
+  return msg || 'Something went wrong talking to Google Drive.';
+}
+function ensureDriveTokenClient(onToken){
+  gdriveTokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: GOOGLE_CLIENT_ID,
+    scope: DRIVE_SCOPE,
+    callback: (resp)=>{
+      if(resp && resp.access_token){ gdriveToken = resp.access_token; if(onToken) onToken(); }
+      else { driveOverlayMsg = 'Google Drive wasn\'t connected' + (resp && resp.error ? ' ('+resp.error+')' : '') + '.'; showDriveOverlay(); }
+    }
+  });
+  return gdriveTokenClient;
+}
+async function driveRequest(opts){
+  await loadGapiClient();
+  gapi.client.setToken({ access_token: gdriveToken });
+  return await gapi.client.request(opts);
+}
+async function driveListBackups(){
+  const resp = await driveRequest({
+    path: '/drive/v3/files', method: 'GET',
+    params: { q: `name contains '${DRIVE_BACKUP_PREFIX}' and trashed=false`, orderBy: 'modifiedTime desc', pageSize: 10, fields: 'files(id,name,modifiedTime,size)', spaces: 'drive' }
+  });
+  return (resp.result && resp.result.files) || [];
+}
+async function driveUploadBackup(json){
+  const name = DRIVE_BACKUP_PREFIX + new Date().toISOString().slice(0,10) + '.json';
+  // if today's backup already exists, overwrite it rather than piling up duplicates
+  const existing = await driveRequest({
+    path: '/drive/v3/files', method: 'GET',
+    params: { q: `name='${name}' and trashed=false`, fields: 'files(id)', spaces: 'drive' }
+  });
+  const found = existing.result && existing.result.files && existing.result.files[0];
+  const boundary = 'calloutboundary' + Date.now();
+  const meta = found ? { name } : { name, mimeType: 'application/json' };
+  const body =
+    `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(meta)}\r\n` +
+    `--${boundary}\r\nContent-Type: application/json\r\n\r\n${json}\r\n--${boundary}--`;
+  await driveRequest({
+    path: found ? '/upload/drive/v3/files/' + found.id : '/upload/drive/v3/files',
+    method: found ? 'PATCH' : 'POST',
+    params: { uploadType: 'multipart' },
+    headers: { 'Content-Type': `multipart/related; boundary=${boundary}` },
+    body
+  });
+  return name;
+}
+async function driveDownloadBackup(fileId){
+  const resp = await driveRequest({ path: '/drive/v3/files/' + fileId, method: 'GET', params: { alt: 'media' } });
+  return resp.body;
+}
+function fmtBytes(n){
+  n = parseInt(n,10); if(isNaN(n)) return '';
+  if(n < 1024) return n + ' B';
+  if(n < 1024*1024) return (n/1024).toFixed(0) + ' KB';
+  return (n/1024/1024).toFixed(1) + ' MB';
+}
+async function showDriveOverlay(){
+  const overlay = document.getElementById('backupOverlay');
+  overlay.classList.remove('hidden');
+  document.getElementById('backupTitle').textContent = 'Google Drive backup';
+  const body = document.getElementById('backupBody');
+  const msgHtml = driveOverlayMsg ? `<div class="note" style="color:var(--safety); margin-bottom:10px;">${esc(driveOverlayMsg)}</div>` : '';
+  driveOverlayMsg = '';
+  if(!gdriveToken){
+    body.innerHTML = `${msgHtml}
+      <p class="note">Saves a copy of all your Callout data to your own Google Drive, and restores it from there — handy for moving between your phone and desktop. Callout can only see backup files it created itself, not the rest of your Drive.</p>
+      <button class="btn safety small" id="driveConnectBtn">Connect Google Drive</button>`;
+    document.getElementById('driveConnectBtn').addEventListener('click', ()=>{
+      try{ ensureDriveTokenClient(()=> showDriveOverlay()).requestAccessToken(); }
+      catch(e){ driveOverlayMsg = "Google's sign-in library hasn't loaded — check your connection and try again."; showDriveOverlay(); }
+    });
+    return;
+  }
+  body.innerHTML = `${msgHtml}
+    <p class="note">Connected to Google Drive.</p>
+    <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px;">
+      <button class="btn safety small" id="driveBackupNowBtn">Back up now</button>
+      <button class="btn secondary small" id="driveDisconnectBtn">Disconnect</button>
+    </div>
+    <div class="note" id="driveStatus"></div>
+    <div class="divider"></div>
+    <label>Restore from a backup</label>
+    <div id="driveList" class="note">Loading backups…</div>`;
+  const statusEl = document.getElementById('driveStatus');
+  document.getElementById('driveDisconnectBtn').addEventListener('click', ()=>{
+    if(window.google && google.accounts.oauth2.revoke) google.accounts.oauth2.revoke(gdriveToken, ()=>{});
+    gdriveToken = null; showDriveOverlay();
+  });
+  document.getElementById('driveBackupNowBtn').addEventListener('click', async (e)=>{
+    e.target.disabled = true; statusEl.textContent = 'Backing up…';
+    try{
+      const name = await driveUploadBackup(JSON.stringify(collectAllData()));
+      statusEl.textContent = 'Saved to Google Drive as ' + name + '.';
+      loadList();
+    }catch(err){ console.error('drive backup failed', err); driveOverlayMsg = driveErrorMessage(err); showDriveOverlay(); return; }
+    e.target.disabled = false;
+  });
+  async function loadList(){
+    const listEl = document.getElementById('driveList');
+    try{
+      const files = await driveListBackups();
+      if(!files.length){ listEl.textContent = 'No backups found yet — use "Back up now" first.'; return; }
+      listEl.innerHTML = files.map(f=>`
+        <div class="appliance-row">
+          <div><div class="t">${esc(f.name)}</div><div class="m">${esc(new Date(f.modifiedTime).toLocaleString())} · ${esc(fmtBytes(f.size))}</div></div>
+          <button class="btn secondary small" data-restore="${esc(f.id)}">Restore</button>
+        </div>`).join('');
+      listEl.querySelectorAll('[data-restore]').forEach(b=> b.addEventListener('click', async ()=>{
+        if(!confirm('Restore this backup? Records in it will overwrite matching records on this device. Anything created only on this device stays as it is.')) return;
+        b.disabled = true; statusEl.textContent = 'Restoring…';
+        try{
+          const text = await driveDownloadBackup(b.dataset.restore);
+          const parsed = JSON.parse(text);
+          if(!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('That file isn\'t a Callout backup.');
+          Object.entries(parsed).forEach(([k,v])=> localStorage.setItem(LS_PREFIX+k, v));
+          Object.keys(jobCache).forEach(k=> delete jobCache[k]);
+          overlay.classList.add('hidden');
+          alert('Backup restored.');
+          render();
+        }catch(err){ console.error('drive restore failed', err); driveOverlayMsg = driveErrorMessage(err); showDriveOverlay(); }
+      }));
+    }catch(err){ console.error('drive list failed', err); driveOverlayMsg = driveErrorMessage(err); showDriveOverlay(); }
+  }
+  loadList();
+}
+document.getElementById('driveBtn').addEventListener('click', showDriveOverlay);
 
 // ---- Google Calendar ----
 const GOOGLE_CLIENT_ID = '65416956502-1grdlilp1crjkfnqsr9vhtorenj6fa9g.apps.googleusercontent.com';
