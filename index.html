@@ -122,6 +122,7 @@
   <button class="btn small secondary" id="exportBtn">Export backup</button>
   <button class="btn small secondary" id="importBtn">Import backup</button>
   <button class="btn small secondary" id="driveBtn">Google Drive backup</button>
+  <button class="btn small secondary" id="aiBtn">AI settings</button>
 </div>
 <div id="backupOverlay" class="hidden" style="position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:50; display:flex; align-items:center; justify-content:center; padding:20px;">
   <div class="card" style="max-width:600px; width:100%; max-height:80vh; overflow:auto;">
@@ -442,6 +443,7 @@ async function showDriveOverlay(){
   loadList();
 }
 document.getElementById('driveBtn').addEventListener('click', showDriveOverlay);
+document.getElementById('aiBtn').addEventListener('click', ()=> showAiSettings());
 
 // ---- Google Calendar ----
 const GOOGLE_CLIENT_ID = '65416956502-1grdlilp1crjkfnqsr9vhtorenj6fa9g.apps.googleusercontent.com';
@@ -538,11 +540,61 @@ async function renderCalendar(main){
 }
 
 // ---- AI helpers (vision scan + web search for manuals) ----
+// The Anthropic key lives only in this browser (never in backups, never in the code). Key name deliberately does NOT start with "callout:" so backups skip it.
+const AI_KEY_STORAGE = 'callout-secret:anthropic-key';
+function getAiKey(){ try{ return localStorage.getItem(AI_KEY_STORAGE) || ''; }catch(e){ return ''; } }
+function aiError(msg){ const e = new Error(msg); e.isAiError = true; return e; }
+function aiErrText(err, fallback){ return (err && err.isAiError) ? err.message : fallback; }
 async function callClaude(messages, tools){
   const body = { model: "claude-sonnet-4-6", max_tokens: 1500, messages };
   if(tools) body.tools = tools;
-  const resp = await fetch("https://api.anthropic.com/v1/messages", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body) });
-  return await resp.json();
+  const key = getAiKey();
+  const headers = { "Content-Type":"application/json" };
+  if(key){
+    headers["x-api-key"] = key;
+    headers["anthropic-version"] = "2023-06-01";
+    headers["anthropic-dangerous-direct-browser-access"] = "true";
+  }
+  let resp;
+  try{ resp = await fetch("https://api.anthropic.com/v1/messages", { method:"POST", headers, body: JSON.stringify(body) }); }
+  catch(e){ throw aiError(key ? "Couldn't reach the AI service — check your connection and try again." : "AI features need an API key on the live app — add one under “AI settings” in the sidebar."); }
+  let data = null;
+  try{ data = await resp.json(); }catch(e){}
+  if(!resp.ok || (data && data.type === 'error')){
+    const apiMsg = data && data.error && data.error.message;
+    if(!key) throw aiError("AI features need an API key on the live app — add one under “AI settings” in the sidebar." + (apiMsg ? " ("+apiMsg+")" : ""));
+    if(resp.status === 401) throw aiError("Anthropic rejected the API key — re-enter it under “AI settings”.");
+    throw aiError(apiMsg || ("The AI request failed (" + resp.status + ")."));
+  }
+  return data;
+}
+function showAiSettings(msg){
+  document.getElementById('backupOverlay').classList.remove('hidden');
+  document.getElementById('backupTitle').textContent = 'AI settings';
+  const has = !!getAiKey();
+  document.getElementById('backupBody').innerHTML = `
+    <p class="note">Badge scanning, “Find manual online”, manual page lookups and analyser printout scanning use Anthropic's AI. Inside Claude's preview this happens automatically; on your live site it needs your own Anthropic API key.</p>
+    <p class="note">The key is stored only in this browser on this device — it isn't saved in your backups, Drive or the code — so enter it once on each device. Usage is billed to your Anthropic API account (console.anthropic.com), which is separate from a Claude chat subscription.</p>
+    ${msg ? `<div class="note" style="color:var(--safety); margin-bottom:8px;">${esc(msg)}</div>` : ''}
+    <div class="field"><label>Anthropic API key ${has ? '(one is saved)' : ''}</label><input type="password" id="aiKeyInput" placeholder="${has ? '••••••••  (leave blank to keep the saved key)' : 'sk-ant-…'}" autocomplete="off"></div>
+    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+      <button class="btn safety small" id="aiKeySaveBtn">Save &amp; test</button>
+      ${has ? '<button class="btn secondary small" id="aiKeyRemoveBtn">Remove key</button>' : ''}
+    </div>
+    <div class="note" id="aiKeyStatus" style="margin-top:8px;"></div>`;
+  const status = document.getElementById('aiKeyStatus');
+  document.getElementById('aiKeySaveBtn').addEventListener('click', async ()=>{
+    const typed = document.getElementById('aiKeyInput').value.trim();
+    if(typed) localStorage.setItem(AI_KEY_STORAGE, typed);
+    if(!getAiKey()){ status.textContent = 'Paste a key first.'; return; }
+    status.textContent = 'Testing…';
+    try{
+      await callClaude([{ role:"user", content:"Reply with the single word OK." }]);
+      status.textContent = 'Key works — badge scanning and manual search are ready on this device.';
+    }catch(err){ status.textContent = aiErrText(err, 'Test failed.'); }
+  });
+  const rm = document.getElementById('aiKeyRemoveBtn');
+  if(rm) rm.addEventListener('click', ()=>{ localStorage.removeItem(AI_KEY_STORAGE); showAiSettings(); });
 }
 function extractJson(text){
   if(!text) throw new Error('No response text from AI.');
@@ -621,6 +673,76 @@ function mapAnalyserReading(entry){
     out[map.key] = val;
   });
   return out;
+}
+// ---- Analyser CSV log import (e.g. a single KANE "Live Readings" export/ticket) ----
+// Produces objects in the exact same shape as parseAnalyserJson, so the same list UI and
+// mapAnalyserReading() handle both without any changes.
+function splitCsvLine(line){
+  return line.split(',').map(c=>c.trim());
+}
+function parseAnalyserCsv(text, fileName){
+  text = text.replace(/^\uFEFF/, '');
+  const lines = text.split(/\r?\n/);
+  let fallbackDate = '';
+  const savedLine = lines.find(l => /File Saved:/i.test(l));
+  if(savedLine){
+    const m = savedLine.match(/(\d{4}-\d{2}-\d{2}|\d{2}\/\d{2}\/\d{4})/);
+    if(m) fallbackDate = m[1];
+  }
+  if(!fallbackDate && fileName){
+    const m = fileName.match(/(\d{4}-\d{2}-\d{2})/);
+    if(m) fallbackDate = m[1];
+  }
+  const headerIdx = lines.findIndex(l => l.trim().replace(/^,/,'').startsWith('Log No.'));
+  if(headerIdx === -1) throw new Error('No log data found in this file.');
+  const headers = splitCsvLine(lines[headerIdx]);
+  const CHAR_MAP = {'₀':'0','₁':'1','₂':'2','₃':'3','₄':'4','₅':'5','₆':'6','₇':'7','₈':'8','₉':'9','ₓ':'x','η':'n','Δ':'d','λ':'l'};
+  const norm = s => (s||'').split('').map(ch=>CHAR_MAP[ch]||ch).join('').replace(/[^\w]/g,'').toLowerCase();
+  const findCol = (...names) => {
+    for(const n of names){
+      const target = norm(n);
+      const i = headers.findIndex(h => norm(h) === target);
+      if(i !== -1) return i;
+    }
+    return -1;
+  };
+  const cols = {
+    time: findCol('Log Time'),
+    CO: findCol('CO(ppm)'),
+    COCO2: findCol('CO/CO2','CO/CO₂'),
+    CO2: findCol('CO2(%)','CO₂(%)'),
+    NOx: findCol('NOx(ppm)','NOₓ(ppm)'),
+    O2: findCol('O2(%)','O₂(%)'),
+    T1: findCol('T1(°C)'),
+    Ta: findCol('Ta(°C)'),
+    dP: findCol('ΔP(mBar)','dP(mBar)'),
+    dT: findCol('ΔT(°C)','dT(°C)'),
+    eff: findCol('η(%)','n(%)')
+  };
+  const rows = [];
+  for(let li = headerIdx+1; li < lines.length; li++){
+    const line = lines[li];
+    if(!line || !line.trim()) continue;
+    const cells = splitCsvLine(line);
+    if(!/^\d+$/.test(cells[0]||'')) continue; // stops at blank/footer lines like "- data was blank"
+    const get = (idx) => idx>=0 ? (cells[idx]||'') : '';
+    const combustion = [];
+    const push = (key, unit, val) => { if(val !== '') combustion.push({key, unit, value: val}); };
+    push('CO','ppm', get(cols.CO));
+    push('CO/CO2','', get(cols.COCO2));
+    push('CO2','%', get(cols.CO2));
+    push('NOx','ppm', get(cols.NOx));
+    push('O2','%', get(cols.O2));
+    push('T1','°C', get(cols.T1));
+    push('Ta','°C', get(cols.Ta));
+    push('PRS','mBar', get(cols.dP));
+    push('NETT','°C', get(cols.dT));
+    push('EFFgr','%', get(cols.eff));
+    if(!combustion.length) continue;
+    rows.push({ report_details: { date: fallbackDate, time: get(cols.time) }, report_data: { COMBUSTION: combustion } });
+  }
+  if(!rows.length) throw new Error('No usable log rows found in this file.');
+  return rows;
 }
 async function findManualOnline(make, model, imageData, serial){
   const serialLine = serial ? ` The unit's serial number is ${serial}.` : '';
@@ -1109,7 +1231,7 @@ function wireApplianceForm(customerId, main, existingAppliance){
       document.getElementById('scanStatus').textContent = 'Scanned — check the fields above before saving.';
     }catch(err){
       console.error('scan failed', err);
-      document.getElementById('scanStatus').textContent = "Couldn't read that badge automatically — enter the details manually.";
+      document.getElementById('scanStatus').textContent = aiErrText(err, "Couldn't read that badge automatically — enter the details manually.");
     }
     scanBtn.disabled = false;
   });
@@ -1146,7 +1268,7 @@ function wireApplianceForm(customerId, main, existingAppliance){
       if(openBtn) openBtn.addEventListener('click', ()=> window.open(result.url, '_blank'));
     }catch(err){
       console.error('manual search failed', err);
-      document.getElementById('manualStatus').textContent = "Search failed — add the link manually.";
+      document.getElementById('manualStatus').textContent = aiErrText(err, "Search failed — add the link manually.");
     }
     btn.disabled = false;
   });
@@ -1669,7 +1791,7 @@ function wireRams(job){
         const ref = await findManualSection(a.make, a.model, a.manual, effectiveType);
         job.manualRefs[a.id] = ref;
       }catch(e){
-        job.manualRefs[a.id] = { chapter:'', page:'', note:'Lookup failed — try again or check the manual manually.' };
+        job.manualRefs[a.id] = { chapter:'', page:'', note: aiErrText(e, 'Lookup failed — try again or check the manual manually.') };
       }
     }
     job.ramsText = ramsTemplate(job, jobAppliances, job.manualRefs);
@@ -1716,7 +1838,10 @@ function completionHTML(job, applianceKey){
     <div class="apform" style="margin-bottom:14px;">
       <label>Import from analyser JSON export</label>
       <input type="file" accept=".json,application/json" id="analyserJsonInput">
-      <div class="note" id="analyserJsonStatus">Exports usually contain every reading the device has logged — pick the one(s) for this job from the list below once loaded.</div>
+      <div class="note">Exports usually contain every reading the device has logged.</div>
+      <label style="margin-top:10px; display:block;">Import a single reading (CSV ticket)</label>
+      <input type="file" accept=".csv,text/csv" id="analyserCsvInput">
+      <div class="note" id="analyserJsonStatus">Load either file — pick the reading(s) for this job from the list below once loaded.</div>
       <div id="analyserJsonList" style="max-height:260px; overflow:auto; margin-top:8px;"></div>
     </div>
     ${COMBUSTION_FIELDS.map(([key,label])=>`
@@ -2036,7 +2161,7 @@ function wireCompletion(job, jobAppliances, applianceKey){
         : "Couldn't make out any readings from that photo — try a clearer shot or enter them manually.";
     }catch(err){
       console.error('analyser scan failed', err);
-      document.getElementById('analyserStatus').textContent = "Couldn't read that printout automatically — enter the readings manually.";
+      document.getElementById('analyserStatus').textContent = aiErrText(err, "Couldn't read that printout automatically — enter the readings manually.");
     }
     scanAnalyserBtn.disabled = false;
   });
@@ -2071,13 +2196,30 @@ function wireCompletion(job, jobAppliances, applianceKey){
     const reader = new FileReader();
     reader.onload = () => {
       try{
-        analyserReadings = parseAnalyserJson(reader.result);
-        if(!analyserReadings.length){ document.getElementById('analyserJsonStatus').textContent = "That file loaded but didn't contain any combustion readings."; return; }
-        document.getElementById('analyserJsonStatus').textContent = `Loaded ${analyserReadings.length} reading${analyserReadings.length===1?'':'s'} — pick the one(s) for this job below (most recent first).`;
+        const loaded = parseAnalyserJson(reader.result);
+        if(!loaded.length){ document.getElementById('analyserJsonStatus').textContent = "That file loaded but didn't contain any combustion readings."; return; }
+        analyserReadings = analyserReadings.concat(loaded);
+        document.getElementById('analyserJsonStatus').textContent = `Loaded ${loaded.length} reading${loaded.length===1?'':'s'} — pick the one(s) for this job below (most recent first).`;
         renderAnalyserJsonList();
       }catch(err){
         console.error('analyser json parse failed', err);
         document.getElementById('analyserJsonStatus').textContent = "That file didn't look like a valid analyser export.";
+      }
+    };
+    reader.readAsText(file);
+  });
+  document.getElementById('analyserCsvInput').addEventListener('change', (e)=>{
+    const file = e.target.files[0]; if(!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try{
+        const loaded = parseAnalyserCsv(reader.result, file.name);
+        analyserReadings = analyserReadings.concat(loaded);
+        document.getElementById('analyserJsonStatus').textContent = `Loaded ${loaded.length} reading${loaded.length===1?'':'s'} from the CSV — pick the one(s) for this job below (most recent first).`;
+        renderAnalyserJsonList();
+      }catch(err){
+        console.error('analyser csv parse failed', err);
+        document.getElementById('analyserJsonStatus').textContent = err.message || "That file didn't look like a valid analyser CSV export.";
       }
     };
     reader.readAsText(file);
